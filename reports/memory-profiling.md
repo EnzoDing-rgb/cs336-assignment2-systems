@@ -26,7 +26,9 @@ $$
 
 **交付范围：** (a)–(e) 来自 8 格 PyTorch memory snapshot 套件；(f) 来自 headless Nsight（`--cuda-memory-usage` + TransformerBlock NVTX）。代码位于 `/root/.dev/ml-sys/cs336/assignment2-systems/cs336_systems/memory_profiling/`。
 
-## (a) 活跃显存时间线
+## (a) Active memory timeline（前向 vs 完整训练步）
+
+在 profiling 脚本中增加 memory profiler 选项（`MemoryCellConfig.mode ∈ {forward, train}`，复用 e2e 的模型尺寸与 mixed-precision），对 xl 分别录制 **仅前向** 与 **完整训练步**（forward + backward + optimizer step）的 snapshot，并在 [pytorch.org/memory_viz](https://pytorch.org/memory_viz) 语义下重建 Active memory timeline。
 
 **录制方式：** warmup 后开启 `_record_memory_history`，跑 **一步**，再 `_dump_snapshot`。曲线按 memory_viz 语义重建（`alloc` 为 +，`free_completed` 为 −）。竖虚线是阶段边界的 **地面真值**（在 `cuda.synchronize` 之后打点），并非事后猜测。
 
@@ -42,22 +44,22 @@ $$
 
 <img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/memory_a_staged_peaks_fp32_train.png" alt="memory_a_staged_peaks_fp32_train" width="520" />
 
-**解答 (a):** 仅前向（未加载模型参数、无 Adam）时显存爬升至约 **39.750 GiB** 后进入平台期，直到释放激活。完整训练步的基线已包含模型参数和 AdamW（约 50.908 GiB），前向将激活堆叠上去，在 `forward`/`loss` 附近达到整步峰值 **65.538 GiB**；`backward` 呈台阶式下降（逐层释放为反传而暂存的中间结果），结束后驻留约 **50.985 GiB**；`optimizer` 几乎平坦（约 50.985 GiB），因为 Adam 状态早在 warmup 阶段就已分配完毕。因此：**前向=爬升/高平台，反向=台阶下降，优化器=平坦**——结合图中的阶段竖线，三段可以明确区分。
+**解答 (a):** 前向-only 时间线在 forward pass 期间从参数地板爬升至约 **39.750 GiB** 的平台（激活堆叠），随后随释放而回落。完整训练步时间线基线已含参数与 AdamW（约 50.9 GiB）；forward 与 loss 阶段继续抬升至整步峰值 **65.538 GiB**；backward 呈台阶式下降（逐层释放为反向传播保存的中间张量），optimizer step 几乎平坦，因 Adam 状态在 warmup 时已分配。结合阶段竖线，可从峰值形状区分 **forward（爬升/高平台）→ backward（台阶下降）→ optimizer（平坦）**。
 
-## (b) 不同 context 下的峰值显存
+## (b) 各 context 下的峰值显存（forward pass vs full training step）
 
 <img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/memory_b_peaks_by_context.png" alt="peaks by context" width="560" />
 
-| context | forward peak (GiB) | train peak (GiB) |
-|--------:|-------------------:|-----------------:|
+| context | forward pass peak (GiB) | full training step peak (GiB) |
+|--------:|------------------------:|------------------------------:|
 | 128 | 18.053 | 51.416 |
 | 512 | 39.750 | 65.538 |
 
 单位：`torch.cuda.max_memory_allocated` 在该次被 profile 的 step 上的全局峰值（GiB）。
-训练步远大于前向的原因：完整一步除了模型参数之外，还要常驻 AdamW 状态，并在反向阶段短暂叠加上梯度；
-context 变长时两者都会增长，但 attention 的 $S\times S$ 项使涨幅快于线性。
 
-## (c) 混合精度（BF16）
+**解答 (b):** xl 在 context=128 时，forward pass 峰值 **18.053 GiB**，完整训练步峰值 **51.416 GiB**；context=512 时分别为 **39.750 GiB** 与 **65.538 GiB**。训练步峰值远高于仅前向，因为除激活外还常驻参数、AdamW 状态，且 backward 阶段会短暂叠加梯度；context 变长时两者均上升，attention 的 $S\times S$ 项使涨幅快于对 $S$ 的线性依赖。
+
+## (c) 混合精度下的峰值显存（BF16）
 
 <img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/memory_c_bf16_vs_fp32.png" alt="BF16 vs FP32 memory" width="640" />
 
@@ -70,40 +72,13 @@ context 变长时两者都会增长，但 attention 的 $S\times S$ 项使涨幅
 | 512 | forward | 39.750 | 36.832 | -2.917 GiB (-7.3%) |
 | 512 | train | 65.538 | 62.674 | -2.864 GiB (-4.4%) |
 
-**解答 (c):** `torch.autocast(bf16)` 只将 **部分矩阵乘的激活** 算成 BF16；**参数本身仍为 FP32**，AdamW 的一阶/二阶动量也仍为 FP32。因此峰值显存里「模型参数 + 优化器状态」这一大块几乎不动——完整训练步的基线就已约 50 GiB（见 (a)），真正可能变窄的只有激活。以 xl·ctx=512 为例：前向峰值 39.750→36.832 GiB（少约 2.9 GiB，−7.3%），训练步峰值 65.538→62.674 GiB（少约 2.9 GiB，−4.4%）；ctx=128 的训练步几乎不变（51.416→51.406 GiB），前向甚至因临时 dtype 转换略增（18.053→22.452 GiB）。换句话说，激活即便理想减半，也只能从总峰值里抠出几个 GiB，绝不可能把 65 GiB 压到 30 GiB 量级。算力侧则不同：BF16 能走 Tensor Core，端到端 step 时间往往能明显缩短（见 `/root/.dev/ml-sys/cs336/assignment2-systems/reports/mixed-precision.md`）；显存峰值这边，对本设定的收益就是「少几个 GiB」，不足以靠混精单独解决 OOM。
+**解答 (c):** 对 xl 开启 mixed precision（`torch.autocast(bf16)`）后，参数与 AdamW 状态仍为 FP32，故训练步峰值中「参数 + 优化器」地板几乎不变；只有激活路径可能变窄。ctx=512 时 forward pass 峰值由 39.750 降至 36.832 GiB（−7.3%），full training step 峰值由 65.538 降至 62.674 GiB（−4.4%）；ctx=128 的训练步几乎不变（51.416→51.406 GiB）。混精可省数个 GiB 激活显存，但不足以单独消除 OOM；算力侧收益见 `reports/mixed-precision.md`。
 
-## 先把「残差」说清楚（读 (d)(f) 之前）
-
-文中会出现三个容易搅在一起、其实并不相同的概念。按计算图里真实发生的事从上到下排：
-
-**1. 残差连接（skip connection）。**  
-这就是何恺明 ResNet 里的 $y=x+f(x)$：旁路把输入原样加到子层输出上，减轻深层网络里梯度难以回传的问题。Transformer 沿用了同一结构。我们的 `BasicsTransformerLM` **确实实现了它**：`TransformerBlock.forward` 里是
-
-```python
-attn_sublayer_output = x + x_attn
-ffn_sublayer_output = attn_sublayer_output + x_ffn
-```
-
-也就是 attention 子层和 FFN 子层各做一次「输入 + 子层输出」。  
-这里的 $x$ 在加法里是**引用同一块显存**，并不会因为「传到下一层」就再复制一份——你的直觉在这一步是对的。
-
-**2. 残差流（residual stream）。**  
-指在各 `TransformerBlock` 之间传递、并被上述加法不断写回的那条主激活，形状 $(B,S,d_{\mathrm{model}})$。它是「网络主干上正在流动的那条向量」，(d) 问的就是**一张**这样的张量有多大。它和 ResNet 有渊源（加法写回主干），但 (d) 要的只是这个张量的字节数，不是在问「有没有实现 ResNet」。
-
-**3. 为反向传播保存的张量（讲义里的 residuals / saved tensors）。**  
-这是另一个词。前向算 $f(x)$ 时，autograd 会把许多**子层内部的中间结果**留下来，反向时才用得上——例如 attention 的 $S\times S$ 分数、FFN 变宽后的中间激活、RMSNorm 的中间量等。讲义 §3 把这些叫 residuals；本文后面统一说 **「保存张量」**，以免和上面的残差连接、残差流混淆。
-
-**为什么显存还会涨、而不能「复用上一层 activation 就完事」？**  
-残差连接只保证「主干上的 $x$」可以共享引用；它**不能**省掉 $f(x)$ 内部新造出来的那些中间张量。更关键的是时间顺序：完整训练步是「整网前向先跑完，再整网反向」。在反向开始之前，各层为反传存下的中间结果通常都还活着——第 1 层算完后并不能马上丢掉它的保存张量，因为反向要等到最后一层之后才从后往前走。于是 32 层的保存张量会叠在一起，这才是 (a) 里前向爬升、反向台阶下降的原因，也是 (f) 要按「单层」去量保存量与梯度的原因。  
-（若用 activation checkpointing，可以故意不存这些中间结果、反向时再算一遍——那是后文的题，此处不做。）
-
-下面 (d) 量的是概念 2（一张残差流有多大）；(e) 看到的最大块往往来自概念 3 里的 attention 分数；(f) 量的是概念 3（一层为反传存了多少、反向又写出多少梯度）。
-
-## (d) 残差流激活大小（解析推导）
+## (d) Transformer residual stream 激活张量大小（单精度）
 
 <img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/memory_d_residual_stream.png" alt="residual stream size" width="640" />
 
-这里的「残差流」即上一节概念 2：主干上形状为 $(B,\,S,\,d_{\mathrm{model}})$ 的主激活——每个 batch、每个 token 位置有一条宽度为 $d_{\mathrm{model}}$ 的向量。xl 的 $d_{\mathrm{model}}=2560$；单精度 FP32 每元素占 4 bytes。因此 **单张** 残差流张量的体积为
+讲义 (d) 所求为 **residual stream** 上单张激活张量的大小：在各 `TransformerBlock` 之间传递、形状为 $(B,\,S,\,d_{\mathrm{model}})$ 的主干激活。xl 的 $d_{\mathrm{model}}=2560$；单精度 FP32 每元素占 4 bytes。体积为
 
 $$
 \frac{B\cdot S\cdot d_{\mathrm{model}}\cdot 4}{1024^{2}}\ \text{MiB}.
@@ -115,13 +90,13 @@ $$
 - $S=512$：$4\cdot 512\cdot 2560\cdot 4/1024^{2}=20.00$ MiB
 - 讲义参考 $S=2048$：$4\cdot 2048\cdot 2560\cdot 4/1024^{2}=80.00$ MiB
 
-**解答 (d):** 上式即为单精度残差流激活的大小。对本报告设定 $B=4,\ S=512$ 为 **20.00 MiB**；若按讲义 $S=2048$ 则为 **80.00 MiB**。注意这只是「单层接口上的一条数据流」，并非整网峰值显存。
+**解答 (d):** 按 $B\cdot S\cdot d_{\mathrm{model}}\cdot 4\ /\ 1024^{2}$，单精度 residual stream 激活为：$S=128$ 时 **5.00 MiB**，$S=512$ 时 **20.00 MiB**，讲义参考 $S=2048$ 时 **80.00 MiB**（均取 $B=4,\ d_{\mathrm{model}}=2560$）。这只是单张主干激活，不是整网峰值。
 
-## (e) 最大分配（前向快照）
+## (e) memory_viz 前向快照中的最大分配（调低 Detail）
 
 <img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/memory_e_attn_score_alloc.png" alt="attention score allocation" width="640" />
 
-从 ctx=512 FP32 前向的快照中，按 `alloc` 体积排序的前 5 大分配（等价于 memory_viz 调低 Detail 后所看到的最大块）：
+对 xl forward pass（ctx=512, FP32）的 snapshot，在 memory_viz 中将 **Detail** 调低后，最小的分配被隐藏，留下最大的块。下表按 `alloc` 体积排序的前 5 项，与「仅显示最大若干 % 分配」时所见一致：
 
 | rank | size (MiB) | stack (truncated) |
 |-----:|-----------:|----------------|
@@ -131,39 +106,25 @@ $$
 | 4 | 128.0 | nn_utils.py:5 softmax<br>model.py:432 scaled_dot_product_attention<br>model.py:520 forward<br>module.py:1750 _call_impl |
 | 5 | 128.0 | nn_utils.py:6 softmax<br>model.py:432 scaled_dot_product_attention<br>model.py:520 forward<br>module.py:1750 _call_impl |
 
-**解答 (e):** 最大的单次分配均为 **128.0 MiB**。其来源与 (d) 不同：这里不是残差流 $(B,S,d)$，而是 attention 中 $QK^{\top}$ 得到的 score（或随后的 softmax 注意力权重），形状为 $(B,H,S,S)=(4,32,512,512)$。体积为
+**解答 (e):** Detail 调低后可见的最大单次分配均为 **128.0 MiB**，来自 `scaled_dot_product_attention` 中的 attention score 或 softmax 后的注意力权重，形状 $(B,H,S,S)=(4,32,512,512)$，即 $B\cdot H\cdot S\cdot S\cdot 4/1024^{2}=128$ MiB；栈指向 `einsum` / `softmax` / `model.py:scaled_dot_product_attention`。这与 (d) 的 residual stream（20 MiB）是不同对象。pickle：`artifacts/memory_profiling/snapshots/xl_ctx512_forward_mpoff/xl_ctx512_forward_mpoff.pickle`。
 
-$$
-\frac{B\cdot H\cdot S\cdot S\cdot 4}{1024^{2}}
-=\frac{4\cdot 32\cdot 512\cdot 512\cdot 4}{1024^{2}}=128\ \text{MiB},
-$$
+## (f) Nsight：单个 TransformerBlock 为 backward 保存的显存与梯度体积
 
-与表中数字一致；调用栈也指向 `scaled_dot_product_attention` 中的 `einsum` / `softmax`。因此「Detail 调低后最大的块」即为 **单层、单份** $S\times S$ attention 激活（在本设定下，每层还会出现多份同类块）。pickle：`/root/.dev/ml-sys/cs336/assignment2-systems/artifacts/memory_profiling/snapshots/xl_ctx512_forward_mpoff/xl_ctx512_forward_mpoff.pickle`（可拖入 [pytorch.org/memory_viz](https://pytorch.org/memory_viz) 复核）。
+### 1. 题目在问什么
 
-## (f) 用 Nsight 看「一层」为反向传播存了多少东西
+结合 Nsight Systems 的 memory profiling 与 PyTorch NVTX 标签，对 **单个 `TransformerBlock`** 问：
 
-### 1. 要干什么？
+1. forward pass 中为 backward 保存了多少中间张量（讲义称 saved tensors；下文记 **保存张量**）？体积最大的 5 类操作各占该层总量的百分之几？
+2. backward pass 经过该层时，这些保存张量被释放，同时写出 gradient tensors；后者占多少显存？是否与参数梯度体积的粗算一致？
 
-前面 (a)–(e) 看的是整网显存曲线和峰值。本题换一个更细的问题，对准的是上一节的**概念 3（保存张量）**，不是概念 1 的残差连接，也不是概念 2 的「一张残差流有多大」：
+工具：Nsight（`--cuda-memory-usage`）录完整训练步；每层包 NVTX；层内保存张量用 `saved_tensors_hooks` 计量（与讲义 §3 同法）。
 
-**只盯住模型里的「一层」**（一个 `TransformerBlock`），问两件事：
+**设定：** xl，$B=4$，$S=512$，FP32，full training step。
 
-1. **前向时，这一层为了以后能做反向传播，额外存了多少中间结果（保存张量）？**  
-   并列出其中体积最大的 5 类，各占这一层总量的百分之几。
-2. **反向经过这一层时，一边释放上面那些保存张量，一边写出梯度；梯度大概占多少显存？**  
-   这个数是否和「这一层参数该有多少梯度」的粗算一致？
+### 2. 量法
 
-工具上：用 Nsight Systems 录一整步训练，并在每一层外面包一层标签（NVTX），这样时间轴上能看见「现在跑到第几层」。  
-层内保存张量的体积，则用 PyTorch 的 `saved_tensors_hooks` 直接数出来（讲义 §3 的同一种量法；讲义把这些保存张量也叫 residuals）。
-
-**本问设定：** xl，batch=4，context=512，FP32，完整训练步（前向 + loss + 反向 + 优化器）。
-
-### 2. 问题是什么？（以及我们怎么量）
-
-需要记住的只有两点：
-
-- **保存张量**：前向算子层 $f(x)$ 时新产生、又必须留到反向才用的中间结果（attention 分数、FFN 中间激活等）。它们不是模型参数，也不是「残差连接里那个被加回去的 $x$」。
-- **梯度**：反向时写出的「参数该怎么改」；一层里还会有一些与激活相关的梯度。
+- **保存张量**：forward 中 autograd 为 backward 保留的中间结果（attention $S\times S$、FFN 中间激活等），不是模型参数，也不是 (d) 中的 residual stream 单张量。
+- **梯度张量**：backward 新写出的 parameter `.grad` 及少量 activation-side gradients。
 
 量法分三步：
 
@@ -185,11 +146,11 @@ $$
 |-----:|--------|----------:|-----------------:|
 | 1 | FFN 中间激活：单张 $(B,S,d_{\mathrm{ff}})=4\cdot512\cdot10240\cdot4/1024^{2}=80$ MiB；本桶合计 $680=8.5\times80$（SwiGLU 的 $w_1x$、$w_3x$、`silu`、逐元乘积等会被多次保存） | 680.0 | 43.4% |
 | 2 | Attention 的 $S\times S$：单张 $(B,H,S,S)=4\cdot32\cdot512\cdot512\cdot4/1024^{2}=128$ MiB；本桶 $384=3\times128$（典型是 score / mask 后 / softmax 注意力权重） | 384.0 | 24.5% |
-| 3 | 残差流 / 隐状态：单张 $(B,S,d)=4\cdot512\cdot2560\cdot4/1024^{2}=20$ MiB；本桶 $360=18\times20$（层内多处 $(B,S,d)$ 激活被为反传保存） | 360.0 | 23.0% |
+| 3 | 层内 $(B,S,d)$ hidden states：单张 $4\cdot512\cdot2560\cdot4/1024^{2}=20$ MiB；本桶 $360=18\times20$（多处 $(B,S,d)$ 激活被为 backward 保存） | 360.0 | 23.0% |
 | 4 | FFN 的 $W_1$ / $W_2$ / $W_3$ 之一（常驻参数；hooks 按形状记 100 MiB，**不是新分配**，见附录 §8.0） | 100.0 | 6.4% |
 | 5 | Attention 投影后的 $Q$ / $K$ / $V$（按 32 头拆开后的激活；本层保存 **2 份**，各 $(B,H,S,d_k)$、20 MiB） | 40.0 | 2.6% |
 
-读表时只需记住一件事：**这一层里，最大头不是「残差流那一条细细的 $(B,S,d)$」，而是 FFN 中间那段更宽的激活，以及 attention 的 $S\times S$ 矩阵。** 这和 (d)(e) 的结论是对齐的——(d) 的残差流只有 20 MiB；(e) 单份 $S\times S$ 是 128 MiB；这里一层里会存多份同类东西，所以汇总后更大。
+读表时：**该层保存量的大头来自 FFN 中间激活与 attention $S\times S$，而非 (d) 中单张 residual stream（20 MiB）**；(e) 单份 $S\times S$ 为 128 MiB，一层内多份叠加后更大。
 
 **步骤 C：$R$ 与 $G$ 到底是什么（以及为什么 $G<R$）。**
 
@@ -248,17 +209,7 @@ $$
 
 ### 3. 结论如何解读？
 
-**解答 (f):**
-
-1. **一层为反向大约要多存 1.5 GiB（这是 $R$）。**  
-   第 16 层保存张量合计 **1566 MiB**。其中最大的一块是 FFN 中间激活（约 43%），其次是 attention 的 $S\times S$（约 25%），再才是残差流 / 隐状态（约 23%）。  
-   所以：显存压力并不主要来自「那条细细的残差流」（概念 2，单张才 20 MiB），而来自 **$f(x)$ 内部新造、又必须留到反向的中间结果**（概念 3）——尤其是 FFN 变宽后的激活和 attention 方阵。
-
-2. **反向时，一层新写出的梯度大约 1.1 GiB（这是 $G$）。**  
-   $G$ 不是又一批「为梯度而存的中间变量」（那是 $R$）；$G$ 是反向算出来的梯度张量本身。净变化 $\Delta\approx-437$ MiB，故 $G\approx\Delta+R\approx1129$ MiB。它高于「只数参数梯度」的约 400 MiB 下界，又小于 $R$，所以反向显存会下降。
-
-3. **和整网峰值怎么连起来想？**  
-   前向时，32 层各自的 $R$ 会叠在一起，所以整网激活远大于「单层 1.5 GiB」。反向时逐层用掉并释放 $R$、写出较小的 $G$，显存呈台阶下降——这正是 (a) 里那条 train 曲线中间段的形状。
+**解答 (f):** 用 NVTX 对齐到第 16 层 `TransformerBlock`：forward 中为 backward **保存张量**合计 **$R\approx1566$ MiB**；体积最大的 5 类为 FFN 中间激活（43.4%）、attention $S\times S$（24.5%）、层内 $(B,S,d)$ hidden states（23.0%）、FFN 参数形状登记（6.4%，hooks 误计，见附录 §8.0）、$Q/K/V$ 投影激活（2.6%）。backward 经过该层时保存张量被释放、同时写出 **gradient tensors**；层间净变化 $\Delta\approx-437$ MiB，故 $G\approx\Delta+R\approx1129$ MiB。$G$ 高于单层参数梯度粗算下界约 400 MiB（因含 activation-side gradients），又小于 $R$，与「backward 释放的保存量大于新写梯度」及 (a) 中训练步台阶下降一致。32 层 forward 时各层 $R$ 叠加，构成整步峰值的主要抬升部分。
 
 产物目录：`/root/.dev/ml-sys/cs336/assignment2-systems/artifacts/memory_profiling/nsys_f/`。
 
