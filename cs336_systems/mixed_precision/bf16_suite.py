@@ -33,7 +33,7 @@ plt.rcParams["axes.unicode_minus"] = False
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ARTIFACTS_ROOT = REPO_ROOT / "artifacts" / "mixed_precision"
-REPORT_PATH = REPO_ROOT / "reports" / "benchmarking-mixed-precision.md"
+REPORT_PATH = REPO_ROOT / "reports" / "mixed-precision.md"
 FIGURES_DIR = REPO_ROOT / "reports" / "figures"
 FIGURE_FWD = FIGURES_DIR / "mixed_precision_forward.png"
 FIGURE_BWD = FIGURES_DIR / "mixed_precision_backward.png"
@@ -169,21 +169,22 @@ def plot_speedup_vs_size(results: list[dict[str, Any]], out_path: Path) -> None:
 
 
 def _md_img(src: str, *, alt: str, width: int = 560) -> str:
+    abs_src = str((REPO_ROOT / "reports" / src).resolve()) if not src.startswith("/") else src
     return (
         f'<p align="center">\n'
-        f'  <img src="{src}" alt="{alt}" width="{width}" />\n'
+        f'  <img src="{abs_src}" alt="{alt}" width="{width}" />\n'
         f"</p>"
     )
 
 
 def write_report(results: list[dict[str, Any]], toy_rows: list[dict[str, Any]] | None) -> None:
     lines: list[str] = [
-        "# Benchmarking Mixed Precision",
+        "## Part B · Benchmarking Mixed Precision",
         "",
-        "Assignment 2 `benchmarking_mixed_precision`：(a)(b) ToyModel + autocast dtype；"
-        "大模型墙钟对比全精度 FP32 vs BF16 autocast（前向 / 反向，不含优化器）。",
+        "(a)(b) ToyModel + autocast dtype；大模型墙钟对比全精度 FP32 vs BF16 autocast"
+        "（前向 / 反向，不含优化器）。",
         "",
-        "## (a) ToyModel 在 autocast 下的数据类型",
+        "### (a) ToyModel 在 autocast 下的数据类型",
         "",
         "脚本：`cs336_systems/mixed_precision/toy_autocast_dtypes.py`。"
         "模型参数初始为 FP32；分别在「无 autocast / FP16 autocast / BF16 autocast」下拆步打印。"
@@ -222,7 +223,7 @@ def write_report(results: list[dict[str, Any]], toy_rows: list[dict[str, Any]] |
             "要点：autocast **不会**把参数本体改成半精度；它改变的是算子输出 / 中间激活的精度。"
             "LayerNorm 在 FP16 策略下保持较高精度输出，与矩阵乘不同。",
             "",
-            "## (b) 为什么 LayerNorm 在 FP16 里被特殊对待？BF16 呢？",
+            "### (b) 为什么 LayerNorm 在 FP16 里被特殊对待？BF16 呢？",
             "",
             "**Answer (b):** LayerNorm 要算均值、方差、开方与归一化，对动态范围和舍入更敏感；"
             "FP16 指数范围窄，方差过小/过大时容易下溢或溢出，所以 autocast 把 LayerNorm 留在 FP32，"
@@ -238,7 +239,7 @@ def write_report(results: list[dict[str, Any]], toy_rows: list[dict[str, Any]] |
         lines += ["（未找到 toy dtype 结果 JSON，请先跑 toy 脚本。）", ""]
 
     lines += [
-        "## (c) 大模型：全精度 vs BF16 混合精度（前向 / 反向）",
+        "### (c) 大模型：全精度 vs BF16 混合精度（前向 / 反向）",
         "",
         "**设定：** `BasicsTransformerLM`；本次实测 size ∈ {medium, large, xl}；batch=4；context=512；"
         "warmup=5；measure=10；**不含** `optimizer.step()`；BF16 使用 `torch.autocast`，**无** GradScaler。"
@@ -305,7 +306,31 @@ def write_report(results: list[dict[str, Any]], toy_rows: list[dict[str, Any]] |
     ]
 
     REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    REPORT_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # Preserve Part A (accumulation) when regenerating Part B.
+    prefix = ""
+    if REPORT_PATH.exists():
+        old = REPORT_PATH.read_text(encoding="utf-8")
+        marker = "## Part B · Benchmarking Mixed Precision"
+        idx = old.find(marker)
+        if idx >= 0:
+            prefix = old[:idx].rstrip() + "\n\n"
+        elif old.startswith("# Mixed Precision"):
+            # Unexpected layout; keep whole file as prefix before Part B.
+            prefix = old.rstrip() + "\n\n---\n\n"
+    if not prefix:
+        prefix = (
+            "# Mixed Precision\n\n"
+            "本报告合并 Assignment 2 混精相关两问：`mixed_precision_accumulation` "
+            "与 `benchmarking_mixed_precision`。\n"
+            f"代码：`{REPO_ROOT / 'cs336_systems' / 'mixed_precision'}/`。\n\n"
+            "---\n\n"
+            "## Part A · Mixed-Precision Accumulation\n\n"
+            "见同目录历史报告内容；请用 "
+            "`python -m cs336_systems.mixed_precision.mixed_precision_accumulation` "
+            "复核累加实验后手工填入本 Part。\n\n"
+            "---\n\n"
+        )
+    REPORT_PATH.write_text(prefix + "\n".join(lines) + "\n", encoding="utf-8")
     print(f"[report] wrote {REPORT_PATH.relative_to(REPO_ROOT)}", flush=True)
 
 
@@ -353,7 +378,7 @@ def run_suite() -> None:
     manifest = {
         "suite_dir": str(suite_dir.relative_to(REPO_ROOT)),
         "results": results,
-        "report": "reports/benchmarking-mixed-precision.md",
+        "report": "reports/mixed-precision.md",
         "figures": [
             "reports/figures/mixed_precision_forward.png",
             "reports/figures/mixed_precision_backward.png",
