@@ -2,6 +2,21 @@
 cs336-spring2024-assignment-2-submission.zip
 test_results.xml
 
+# Local benchmark / run artifacts
+artifacts/
+*.pt
+*.pth
+wandb/
+.uv/
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.ty_cache/
+uv_cache/
+code.zip
+submission.zip
+*.egg-info/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -162,3 +177,6 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# Local Nsight Systems extract (large)
+tools/nsight-systems-*/
