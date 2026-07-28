@@ -362,25 +362,43 @@ def _tile_rows(rows: list[dict]) -> list[dict]:
     return [r for r in rows if r.get("experiment") == "tile"]
 
 
-def _lookup_ms(
+def _lookup_cell(
     rows: list[dict], *, impl: str, dtype: str, metric: str, d_model: int, seq_len: int
-) -> float | None:
+) -> tuple[float | None, bool]:
+    """Return (latency_ms, is_estimated). Missing → (None, False).
+
+    Partial OOM (e.g. forward ok, backward OOM) still returns whichever metrics exist.
+    """
     for r in rows:
         if (
             r["impl"] == impl
             and r["dtype"] == dtype
             and r["d_model"] == d_model
             and r["seq_len"] == seq_len
-            and not r.get("oom")
             and not r.get("skipped")
-            and not r.get("error")
             and r.get(metric) is not None
         ):
-            return float(r[metric])
-    return None
+            return float(r[metric]), bool(r.get("estimated"))
+    return None, False
 
 
-def _grouped_bars(ax, x_labels: list[str], series: dict[str, list[float | None]], ylabel: str, title: str) -> None:
+def _lookup_ms(
+    rows: list[dict], *, impl: str, dtype: str, metric: str, d_model: int, seq_len: int
+) -> float | None:
+    val, _ = _lookup_cell(
+        rows, impl=impl, dtype=dtype, metric=metric, d_model=d_model, seq_len=seq_len
+    )
+    return val
+
+
+def _grouped_bars(
+    ax,
+    x_labels: list[str],
+    series: dict[str, list[float | None]],
+    ylabel: str,
+    title: str,
+    estimated: dict[str, list[bool]] | None = None,
+) -> None:
     import numpy as np
 
     n = len(x_labels)
@@ -389,22 +407,38 @@ def _grouped_bars(ax, x_labels: list[str], series: dict[str, list[float | None]]
     width = min(0.25, 0.8 / n_impl)
     offsets = (np.arange(n_impl) - (n_impl - 1) / 2.0) * width
     labeled: set[str] = set()
+    est_labeled = False
     for i, impl in enumerate(MAIN_IMPLS):
         style = _IMPL_BAR[impl]
         for j, y in enumerate(series[impl]):
             if y is None:
                 continue
+            is_est = bool(estimated and estimated.get(impl) and estimated[impl][j])
             lab = style["label"] if impl not in labeled else None
             ax.bar(
                 x[j] + offsets[i],
                 y,
                 width=width * 0.92,
                 color=style["color"],
-                edgecolor="white",
-                linewidth=0.4,
+                alpha=0.45 if is_est else 1.0,
+                hatch="///" if is_est else None,
+                edgecolor="#333333" if is_est else "white",
+                linewidth=0.5 if is_est else 0.4,
                 label=lab,
             )
             labeled.add(impl)
+            if is_est and not est_labeled:
+                # invisible proxy for legend entry
+                ax.bar(
+                    [],
+                    [],
+                    color="#888888",
+                    alpha=0.45,
+                    hatch="///",
+                    edgecolor="#333333",
+                    label="estimated (hatched)",
+                )
+                est_labeled = True
     ax.set_xticks(x)
     ax.set_xticklabels(x_labels)
     ax.set_ylabel(ylabel)
@@ -441,25 +475,32 @@ def make_figures(rows: list[dict]) -> list[Path]:
         ("backward_ms", "latency (ms)", "flash_bench_backward_vs_seq.png", "Backward"),
         ("e2e_ms", "latency (ms)", "flash_bench_e2e_vs_seq.png", "Forward + backward"),
     ):
-        fig, axes = plt.subplots(1, 2, figsize=(13.5, 4.8), sharey=True)
+        fig, axes = plt.subplots(1, 2, figsize=(14.5, 5.0), sharey=True)
         for ax, dtype in zip(axes, ("fp32", "bf16")):
-            series = {
-                impl: [
-                    _lookup_ms(main, impl=impl, dtype=dtype, metric=metric, d_model=focus_d, seq_len=s)
-                    for s in seqs_for_bars
-                ]
-                for impl in MAIN_IMPLS
-            }
+            series: dict[str, list[float | None]] = {}
+            est_flags: dict[str, list[bool]] = {}
+            for impl in MAIN_IMPLS:
+                vals: list[float | None] = []
+                flags: list[bool] = []
+                for s in seqs_for_bars:
+                    v, e = _lookup_cell(
+                        main, impl=impl, dtype=dtype, metric=metric, d_model=focus_d, seq_len=s
+                    )
+                    vals.append(v)
+                    flags.append(e)
+                series[impl] = vals
+                est_flags[impl] = flags
             _grouped_bars(
                 ax,
                 [str(s) for s in seqs_for_bars],
                 series,
                 ylab,
                 f"{title} · d={focus_d} · {dtype}",
+                estimated=est_flags,
             )
             ax.set_xlabel("sequence length $S$")
         fig.suptitle(
-            f"Grouped bars · d={focus_d} · naive / flash_pytorch / flash_triton · log y · gap = unmeasured",
+            f"Grouped bars · d={focus_d} · solid=measured · hatched=estimated · gap=OOM/missing · log y",
             fontsize=9,
             y=1.02,
         )
@@ -473,19 +514,32 @@ def make_figures(rows: list[dict]) -> list[Path]:
         ("backward_ms", "latency (ms)", "flash_bench_backward_vs_d.png", "Backward"),
         ("e2e_ms", "latency (ms)", "flash_bench_e2e_vs_d.png", "Forward + backward"),
     ):
-        fig, axes = plt.subplots(1, 3, figsize=(14.5, 4.4), sharey=True)
+        fig, axes = plt.subplots(1, 3, figsize=(14.5, 4.6), sharey=True)
         for ax, S in zip(axes, seqs_for_d_plot):
-            series = {
-                impl: [
-                    _lookup_ms(main, impl=impl, dtype="fp32", metric=metric, d_model=d, seq_len=S)
-                    for d in D_MODEL
-                ]
-                for impl in MAIN_IMPLS
-            }
-            _grouped_bars(ax, [str(d) for d in D_MODEL], series, ylab, f"{title} · S={S} · fp32")
+            series: dict[str, list[float | None]] = {}
+            est_flags: dict[str, list[bool]] = {}
+            for impl in MAIN_IMPLS:
+                vals: list[float | None] = []
+                flags: list[bool] = []
+                for d in D_MODEL:
+                    v, e = _lookup_cell(
+                        main, impl=impl, dtype="fp32", metric=metric, d_model=d, seq_len=S
+                    )
+                    vals.append(v)
+                    flags.append(e)
+                series[impl] = vals
+                est_flags[impl] = flags
+            _grouped_bars(
+                ax,
+                [str(d) for d in D_MODEL],
+                series,
+                ylab,
+                f"{title} · S={S} · fp32",
+                estimated=est_flags,
+            )
             ax.set_xlabel("embedding dim $d$")
         fig.suptitle(
-            "Grouped bars · fp32 · naive / flash_pytorch / flash_triton · log y · gap = unmeasured",
+            "Grouped bars · fp32 · solid=measured · hatched=estimated · gap=OOM/missing · log y",
             fontsize=9,
             y=1.03,
         )
