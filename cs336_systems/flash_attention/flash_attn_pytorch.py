@@ -39,6 +39,9 @@ def flash_attention_forward_pytorch(Q, K, V, B_q=16, B_k=16, is_causal=False):
     # 分块前向（Algorithm 1）：把 Q 沿 seq 维切成 T_q 块，K/V 切成 T_k 块。
     # 外层遍历 query 块，内层遍历 key 块，用 m_i / l_i / O_i 三个运行量把每块结果
     # 合并成和朴素前向一致的 O 和 L。S 和 P 始终留在片上，不写回 HBM。
+    #
+    # 数值上：无论输入是 fp32 还是 bf16，分块累加一律在 fp32 里做，最后再写回 Q.dtype。
+    # 否则 bf16 的 V 与 fp32 的 P̃ 做 einsum 会直接报类型错误。
 
     batch = Q.shape[0]
     N_q = Q.shape[1]
@@ -52,7 +55,7 @@ def flash_attention_forward_pytorch(Q, K, V, B_q=16, B_k=16, is_causal=False):
 
     # 外层：每次取一个 query 块 Q_i，形状 (batch, B_q, d)。
     for i in range(0, N_q, B_q):
-        Q_i = Q[:, i : i + B_q, :]
+        Q_i = Q[:, i : i + B_q, :].float()
         b_q = Q_i.shape[1]
 
         # 三个运行量，都按行（每个 query）维护。
@@ -65,8 +68,8 @@ def flash_attention_forward_pytorch(Q, K, V, B_q=16, B_k=16, is_causal=False):
 
         # 内层：每次取一个 key/value 块，形状 (batch, B_k, d)。
         for j in range(0, N_k, B_k):
-            K_j = K[:, j : j + B_k, :]
-            V_j = V[:, j : j + B_k, :]
+            K_j = K[:, j : j + B_k, :].float()
+            V_j = V[:, j : j + B_k, :].float()
 
             # 当前子块分数 Sij，形状 (batch, B_q, B_k)。
             Sij = einsum(Q_i, K_j, "b q d, b k d -> b q k") * scale
@@ -108,15 +111,18 @@ def flash_attention_forward_pytorch(Q, K, V, B_q=16, B_k=16, is_causal=False):
 
     return O, L
 
+
 def _flash_attention_backward_impl(Q, K, V, O, dO, L, is_causal: bool = False):
     # Eq.13–19：用存下的 L（及 O）重算 P，再反传；不依赖前向长期保存的大 P。
-    # D = rowsum(O ∘ dO)，这里的 D 不是隐藏维 d。
-    # Q: q d
-    # K: k d
-    # V: k d
-    # S: q k
-    # P: q k
-    # O: q d
+    # 全程在 fp32 里算，最后把梯度转回输入 dtype（支持 bf16）。
+    out_dtype = Q.dtype
+    Q = Q.float()
+    K = K.float()
+    V = V.float()
+    O = O.float()
+    dO = dO.float()
+    L = L.float()
+
     d = Q.shape[-1]
     scale = 1.0 / math.sqrt(d)
     N_q = Q.shape[-2]
@@ -144,8 +150,7 @@ def _flash_attention_backward_impl(Q, K, V, O, dO, L, is_causal: bool = False):
     # (18)(19) dQ = dS K / sqrt(d)，dK = dS^T Q / sqrt(d)
     dQ = einsum(dS, K, "... q k, ... k d -> ... q d") * scale
     dK = einsum(dS, Q, "... q k, ... q d -> ... k d") * scale
-    return dQ, dK, dV
-
+    return dQ.to(out_dtype), dK.to(out_dtype), dV.to(out_dtype)
 
 # 作业要求：反向用普通 PyTorch + torch.compile（非 Triton）。
 flash_attention_backward_pytorch = torch.compile(_flash_attention_backward_impl)

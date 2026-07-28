@@ -105,6 +105,7 @@ class BenchmarkConfig:
     mixed_precision: MixedPrecision = "off"
     # When False, timed_train still measures forward/loss/backward but skips AdamW.step().
     do_optimizer: bool = True
+    use_compile: bool = False
 
     def resolved_model_hparams(self) -> dict[str, int]:
         if self.model_size not in MODEL_SIZE_PRESETS:
@@ -162,6 +163,13 @@ class _Tee:
     def flush(self) -> None:
         for stream in self.streams:
             stream.flush()
+
+    def isatty(self) -> bool:
+        for stream in self.streams:
+            isatty = getattr(stream, "isatty", None)
+            if callable(isatty) and isatty():
+                return True
+        return False
 
 
 def _sync(device: torch.device) -> None:
@@ -364,6 +372,7 @@ def run_benchmark(cfg: BenchmarkConfig, artifacts_root: Path | None = None) -> B
                     ("num_heads", str(model_hparams["num_heads"])),
                     ("mixed_precision", cfg.mixed_precision),
                     ("do_optimizer", str(cfg.do_optimizer)),
+                    ("use_compile", str(cfg.use_compile)),
                     ("artifact_dir", str(artifact_dir)),
                 ],
             )
@@ -371,6 +380,9 @@ def run_benchmark(cfg: BenchmarkConfig, artifacts_root: Path | None = None) -> B
             print("\n── Build ──")
             print("  initializing model …")
             model = build_model(cfg, device)
+            if cfg.use_compile:
+                print("  torch.compile(model) …")
+                model = torch.compile(model)
             model.train()
             optimizer = AdamW(model.parameters())
             x, y = make_batch(cfg, device)

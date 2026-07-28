@@ -16,6 +16,9 @@ DEFAULT_ITERS = 100
 DEFAULT_SEED = 42
 
 
+COMPILE_EXTRA_WARMUP = 10
+
+
 @dataclass(frozen=True)
 class AttentionBenchmarkConfig:
     batch_size: int = DEFAULT_BATCH_SIZE
@@ -24,6 +27,7 @@ class AttentionBenchmarkConfig:
     warmup: int = DEFAULT_WARMUP
     iters: int = DEFAULT_ITERS
     seed: int = DEFAULT_SEED
+    use_compile: bool = False
 
 
 @dataclass
@@ -37,6 +41,7 @@ class BenchmarkResult:
     memory_before_backward_gib: float | None
     oom: bool
     error: str | None
+    use_compile: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -62,13 +67,14 @@ def _make_qkv(cfg: AttentionBenchmarkConfig, device: torch.device) -> tuple[torc
     return q, k, v
 
 
-def _step(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-) -> torch.Tensor:
-    out = scaled_dot_product_attention(Q=q, K=k, V=v, mask=None)
-    return out.sum()
+def _attention_forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    return scaled_dot_product_attention(Q=q, K=k, V=v, mask=None)
+
+
+def _make_attention_fn(use_compile: bool):
+    if not use_compile:
+        return _attention_forward
+    return torch.compile(_attention_forward)
 
 
 def benchmark_cell(cfg: AttentionBenchmarkConfig, device: torch.device | None = None) -> BenchmarkResult:
@@ -87,12 +93,15 @@ def benchmark_cell(cfg: AttentionBenchmarkConfig, device: torch.device | None = 
         batch_size=cfg.batch_size,
         seq_len=cfg.seq_len,
         d_model=cfg.d_model,
+        use_compile=cfg.use_compile,
     )
+    attention_fn = _make_attention_fn(cfg.use_compile)
+    warmup_iters = cfg.warmup + (COMPILE_EXTRA_WARMUP if cfg.use_compile else 0)
 
     try:
-        for _ in range(cfg.warmup):
+        for _ in range(warmup_iters):
             q, k, v = _make_qkv(cfg, device)
-            out = _step(q, k, v)
+            out = attention_fn(q, k, v).sum()
             out.backward()
             q.grad = None
             k.grad = None
@@ -108,7 +117,7 @@ def benchmark_cell(cfg: AttentionBenchmarkConfig, device: torch.device | None = 
             q, k, v = _make_qkv(cfg, device)
 
             t0 = time.perf_counter()
-            out = _step(q, k, v)
+            out = attention_fn(q, k, v).sum()
             _sync(device)
             t1 = time.perf_counter()
             forward_total += t1 - t0

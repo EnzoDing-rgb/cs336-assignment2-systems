@@ -344,13 +344,13 @@ def run_tile_ablation(smoke: bool = False) -> list[CellResult]:
 
 
 # ---------------------------------------------------------------------------
-# Plotting
+# Plotting — grouped bar charts
 # ---------------------------------------------------------------------------
 
-_IMPL_STYLE = {
-    IMPL_NAIVE: dict(linestyle="-", marker="o", linewidth=1.9, label="naive attention"),
-    IMPL_PT: dict(linestyle="--", marker="s", linewidth=1.6, label="flash_pytorch"),
-    IMPL_TRITON: dict(linestyle=":", marker="D", linewidth=1.8, label="flash_triton"),
+_IMPL_BAR = {
+    IMPL_NAIVE: dict(color="#4C78A8", label="naive attention"),
+    IMPL_PT: dict(color="#F58518", label="flash_pytorch"),
+    IMPL_TRITON: dict(color="#54A24B", label="flash_triton"),
 }
 
 
@@ -362,7 +362,63 @@ def _tile_rows(rows: list[dict]) -> list[dict]:
     return [r for r in rows if r.get("experiment") == "tile"]
 
 
+def _lookup_ms(
+    rows: list[dict], *, impl: str, dtype: str, metric: str, d_model: int, seq_len: int
+) -> float | None:
+    for r in rows:
+        if (
+            r["impl"] == impl
+            and r["dtype"] == dtype
+            and r["d_model"] == d_model
+            and r["seq_len"] == seq_len
+            and not r.get("oom")
+            and not r.get("skipped")
+            and not r.get("error")
+            and r.get(metric) is not None
+        ):
+            return float(r[metric])
+    return None
+
+
+def _grouped_bars(ax, x_labels: list[str], series: dict[str, list[float | None]], ylabel: str, title: str) -> None:
+    import numpy as np
+
+    n = len(x_labels)
+    x = np.arange(n, dtype=float)
+    n_impl = len(MAIN_IMPLS)
+    width = min(0.25, 0.8 / n_impl)
+    offsets = (np.arange(n_impl) - (n_impl - 1) / 2.0) * width
+    labeled: set[str] = set()
+    for i, impl in enumerate(MAIN_IMPLS):
+        style = _IMPL_BAR[impl]
+        for j, y in enumerate(series[impl]):
+            if y is None:
+                continue
+            lab = style["label"] if impl not in labeled else None
+            ax.bar(
+                x[j] + offsets[i],
+                y,
+                width=width * 0.92,
+                color=style["color"],
+                edgecolor="white",
+                linewidth=0.4,
+                label=lab,
+            )
+            labeled.add(impl)
+    ax.set_xticks(x)
+    ax.set_xticklabels(x_labels)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.set_yscale("log")
+    ax.set_axisbelow(True)
+    ax.grid(True, axis="y", alpha=0.35, linestyle="--")
+    ax.legend(frameon=True, fancybox=False, edgecolor="#cccccc", fontsize=8)
+
+
 def make_figures(rows: list[dict]) -> list[Path]:
+    """Grouped bars: at each x, naive / flash_pytorch / flash_triton side by side."""
+    import numpy as np
+
     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
     plt.rcParams.update(
         {
@@ -372,56 +428,38 @@ def make_figures(rows: list[dict]) -> list[Path]:
             "legend.fontsize": 8,
             "figure.facecolor": "white",
             "axes.facecolor": "#fafafa",
-            "axes.grid": True,
-            "grid.alpha": 0.35,
-            "grid.linestyle": "--",
         }
     )
     paths: list[Path] = []
     main = _main_rows(rows)
-    d_colors = {16: "#4C78A8", 32: "#F58518", 64: "#54A24B", 128: "#E45756"}
+    focus_d = 64
+    seqs_for_bars = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
+    seqs_for_d_plot = [512, 2048, 8192]
 
-    def series_vs_s(impl: str, dtype: str, metric: str, d_model: int):
-        xs, ys = [], []
-        for r in main:
-            if (
-                r["impl"] == impl
-                and r["dtype"] == dtype
-                and r["d_model"] == d_model
-                and not r.get("oom")
-                and not r.get("skipped")
-                and r.get(metric) is not None
-            ):
-                xs.append(r["seq_len"])
-                ys.append(r[metric])
-        order = sorted(range(len(xs)), key=lambda i: xs[i])
-        return [xs[i] for i in order], [ys[i] for i in order]
-
-    # --- main: vs S ---
     for metric, ylab, fname, title in (
-        ("forward_ms", "Forward latency (ms)", "flash_bench_forward_vs_seq.png", "Forward vs sequence length"),
-        ("backward_ms", "Backward latency (ms)", "flash_bench_backward_vs_seq.png", "Backward vs sequence length"),
-        ("e2e_ms", "End-to-end latency (ms)", "flash_bench_e2e_vs_seq.png", "End-to-end vs sequence length"),
+        ("forward_ms", "latency (ms)", "flash_bench_forward_vs_seq.png", "Forward"),
+        ("backward_ms", "latency (ms)", "flash_bench_backward_vs_seq.png", "Backward"),
+        ("e2e_ms", "latency (ms)", "flash_bench_e2e_vs_seq.png", "Forward + backward"),
     ):
-        fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.8), sharey=True)
+        fig, axes = plt.subplots(1, 2, figsize=(13.5, 4.8), sharey=True)
         for ax, dtype in zip(axes, ("fp32", "bf16")):
-            for d in D_MODEL:
-                color = d_colors[d]
-                for impl in MAIN_IMPLS:
-                    xs, ys = series_vs_s(impl, dtype, metric, d)
-                    if not xs:
-                        continue
-                    st = dict(_IMPL_STYLE[impl])
-                    lab = st.pop("label")
-                    ax.plot(xs, ys, color=color, markersize=4.5, label=f"{lab} d={d}", **st)
-            ax.set_xscale("log", base=2)
-            ax.set_yscale("log")
+            series = {
+                impl: [
+                    _lookup_ms(main, impl=impl, dtype=dtype, metric=metric, d_model=focus_d, seq_len=s)
+                    for s in seqs_for_bars
+                ]
+                for impl in MAIN_IMPLS
+            }
+            _grouped_bars(
+                ax,
+                [str(s) for s in seqs_for_bars],
+                series,
+                ylab,
+                f"{title} · d={focus_d} · {dtype}",
+            )
             ax.set_xlabel("sequence length $S$")
-            ax.set_ylabel(ylab)
-            ax.set_title(f"{title} · {dtype}")
-            ax.legend(ncols=2, frameon=True, fancybox=False, edgecolor="#cccccc", fontsize=7)
         fig.suptitle(
-            "Solid+circle = naive attention · Dashed+square = flash_pytorch · Dotted+diamond = flash_triton · Color = $d$",
+            f"Grouped bars · d={focus_d} · naive / flash_pytorch / flash_triton · log y · gap = unmeasured",
             fontsize=9,
             y=1.02,
         )
@@ -429,120 +467,93 @@ def make_figures(rows: list[dict]) -> list[Path]:
         fig.savefig(out, dpi=180, bbox_inches="tight")
         plt.close(fig)
         paths.append(out)
-
-    # --- main: vs d (selected S) ---
-    seq_for_d = [512, 2048, 8192]
-    s_colors = {512: "#4C78A8", 2048: "#F58518", 8192: "#54A24B"}
-
-    def point(impl, dtype, metric, d_model, seq_len):
-        for r in main:
-            if (
-                r["impl"] == impl
-                and r["dtype"] == dtype
-                and r["d_model"] == d_model
-                and r["seq_len"] == seq_len
-                and not r.get("oom")
-                and not r.get("skipped")
-                and r.get(metric) is not None
-            ):
-                return r[metric]
-        return None
 
     for metric, ylab, fname, title in (
-        ("forward_ms", "Forward latency (ms)", "flash_bench_forward_vs_d.png", "Forward vs embedding dim"),
-        ("backward_ms", "Backward latency (ms)", "flash_bench_backward_vs_d.png", "Backward vs embedding dim"),
-        ("e2e_ms", "End-to-end latency (ms)", "flash_bench_e2e_vs_d.png", "End-to-end vs embedding dim"),
+        ("forward_ms", "latency (ms)", "flash_bench_forward_vs_d.png", "Forward"),
+        ("backward_ms", "latency (ms)", "flash_bench_backward_vs_d.png", "Backward"),
+        ("e2e_ms", "latency (ms)", "flash_bench_e2e_vs_d.png", "Forward + backward"),
     ):
-        fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.8), sharey=True)
-        for ax, dtype in zip(axes, ("fp32", "bf16")):
-            for s in seq_for_d:
-                color = s_colors[s]
-                for impl in MAIN_IMPLS:
-                    xs, ys = [], []
-                    for d in D_MODEL:
-                        y = point(impl, dtype, metric, d, s)
-                        if y is not None:
-                            xs.append(d)
-                            ys.append(y)
-                    if not xs:
-                        continue
-                    st = dict(_IMPL_STYLE[impl])
-                    lab = st.pop("label")
-                    ax.plot(xs, ys, color=color, markersize=5, label=f"{lab} S={s}", **st)
-            ax.set_xticks(D_MODEL)
+        fig, axes = plt.subplots(1, 3, figsize=(14.5, 4.4), sharey=True)
+        for ax, S in zip(axes, seqs_for_d_plot):
+            series = {
+                impl: [
+                    _lookup_ms(main, impl=impl, dtype="fp32", metric=metric, d_model=d, seq_len=S)
+                    for d in D_MODEL
+                ]
+                for impl in MAIN_IMPLS
+            }
+            _grouped_bars(ax, [str(d) for d in D_MODEL], series, ylab, f"{title} · S={S} · fp32")
             ax.set_xlabel("embedding dim $d$")
-            ax.set_ylabel(ylab)
-            ax.set_yscale("log")
-            ax.set_title(f"{title} · {dtype}")
-            ax.legend(ncols=2, frameon=True, fancybox=False, edgecolor="#cccccc", fontsize=7)
         fig.suptitle(
-            "Solid = naive attention · Dashed = flash_pytorch · Dotted = flash_triton · Color = $S$",
+            "Grouped bars · fp32 · naive / flash_pytorch / flash_triton · log y · gap = unmeasured",
             fontsize=9,
-            y=1.02,
+            y=1.03,
         )
         out = FIGURES_DIR / fname
         fig.savefig(out, dpi=180, bbox_inches="tight")
         plt.close(fig)
         paths.append(out)
 
-    # --- tile ablation: latency vs tile size ---
     tile_data = _tile_rows(rows)
     if tile_data:
-        fig, axes = plt.subplots(1, 3, figsize=(14.5, 4.6))
-        metrics = (
-            ("forward_ms", "Forward (ms)"),
-            ("backward_ms", "Backward (ms)"),
-            ("e2e_ms", "End-to-end (ms)"),
+        S0, d0 = 2048, 64
+        bqs = sorted(
+            {
+                int(r["B_q"])
+                for r in tile_data
+                if r["seq_len"] == S0 and r["d_model"] == d0 and r.get("B_q") is not None
+            }
         )
-        # x-axis order by numeric tile area; heuristic last per point plotted separately
-        point_colors = {
-            (2048, 64): "#4C78A8",
-            (4096, 64): "#F58518",
-            (8192, 64): "#54A24B",
-            (8192, 128): "#E45756",
-        }
-        for ax, (metric, ylab) in zip(axes, metrics):
-            for impl, ls, mk in ((IMPL_PT, "--", "s"), (IMPL_TRITON, ":", "D")):
-                for (S, d), color in point_colors.items():
-                    pts = []
-                    for r in tile_data:
-                        if (
-                            r["impl"] == impl
-                            and r["seq_len"] == S
-                            and r["d_model"] == d
-                            and not r.get("oom")
-                            and not r.get("skipped")
-                            and r.get(metric) is not None
-                            and r.get("B_q") is not None
-                        ):
-                            # skip pure heuristic label duplication: still plot by resolved B_q
-                            pts.append((r["B_q"], r[metric], r["tile_label"]))
-                    # dedupe by B_q (heuristic may collide with a fixed size)
-                    by_bq: dict[int, float] = {}
-                    for bq, y, _lab in pts:
-                        by_bq[bq] = y
-                    if not by_bq:
+
+        def tile_ms(impl: str, bq: int, metric: str) -> float | None:
+            for r in tile_data:
+                if (
+                    r["impl"] == impl
+                    and r["seq_len"] == S0
+                    and r["d_model"] == d0
+                    and r.get("B_q") == bq
+                    and r.get(metric) is not None
+                    and not r.get("oom")
+                    and not r.get("error")
+                ):
+                    return float(r[metric])
+            return None
+
+        fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.4))
+        for ax, (metric, title) in zip(
+            axes,
+            (("forward_ms", "Forward"), ("backward_ms", "Backward"), ("e2e_ms", "Forward + backward")),
+        ):
+            x = np.arange(len(bqs), dtype=float)
+            width = 0.35
+            for i, impl in enumerate((IMPL_PT, IMPL_TRITON)):
+                style = _IMPL_BAR[impl]
+                plotted = False
+                for j, bq in enumerate(bqs):
+                    y = tile_ms(impl, bq, metric)
+                    if y is None:
                         continue
-                    xs = sorted(by_bq)
-                    ys = [by_bq[x] for x in xs]
-                    ax.plot(
-                        xs,
-                        ys,
-                        linestyle=ls,
-                        marker=mk,
-                        color=color,
-                        markersize=5,
-                        linewidth=1.6,
-                        label=f"{'pt' if impl == IMPL_PT else 'triton'} S={S} d={d}",
+                    ax.bar(
+                        x[j] + (i - 0.5) * width,
+                        y,
+                        width=width * 0.9,
+                        color=style["color"],
+                        edgecolor="white",
+                        linewidth=0.4,
+                        label=style["label"] if not plotted else None,
                     )
-            ax.set_xscale("log", base=2)
+                    plotted = True
+            ax.set_xticks(x)
+            ax.set_xticklabels([str(b) for b in bqs])
+            ax.set_xlabel("tile size $B_q$ (=$B_k$)")
+            ax.set_ylabel("latency (ms)")
+            ax.set_title(f"{title} · S={S0}, d={d0}")
             ax.set_yscale("log")
-            ax.set_xlabel("tile $B_q$ (= $B_k$)")
-            ax.set_ylabel(ylab)
-            ax.set_title(ylab)
-            ax.legend(fontsize=6, ncols=1, frameon=True, fancybox=False, edgecolor="#cccccc")
+            ax.set_axisbelow(True)
+            ax.grid(True, axis="y", alpha=0.35, linestyle="--")
+            ax.legend(frameon=True, fancybox=False, edgecolor="#cccccc", fontsize=8)
         fig.suptitle(
-            "Tile ablation (fp32) · Dashed = flash_pytorch · Dotted = flash_triton · Color = (S, d)",
+            "Tile ablation · flash_pytorch / flash_triton · fp32 · gap = failed/unmeasured",
             fontsize=9,
             y=1.03,
         )
@@ -571,8 +582,14 @@ def _fmt_ms(x: float | None, oom: bool, skipped: bool, err: str | None = None) -
 
 
 def write_report(rows: list[dict], figure_paths: list[Path]) -> None:
-    """中文报告：设置 → 每图解析 → 文末总结论（结论不前置）。"""
+    """中文报告：设置 → 每图解析 → 文末总结论（结论不前置）。
+
+    若报告里已有「人工维护」标记，则不再自动覆盖（避免把通俗改写冲掉）。
+    """
     REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if REPORT_PATH.exists() and "<!-- report:hand-maintained -->" in REPORT_PATH.read_text(encoding="utf-8"):
+        print(f"skip overwrite (hand-maintained): {REPORT_PATH}", flush=True)
+        return
     gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
     main = _main_rows(rows)
     tile = _tile_rows(rows)

@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>grad_x 能不能也要 partial sum？</title>
+  <style>
+    :root {
+      --bg: #fafafa; --card: #fff; --text: #1a1a1a; --muted: #5c5c5c; --border: #ddd;
+      --row0: #dbeafe; --row1: #ffedd5; --w0: #dcfce7; --w1: #fae8ff;
+      --direct: #16a34a; --partial: #7c3aed; --sum: #db2777; --accent: #2563eb;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: var(--bg); color: var(--text);
+      line-height: 1.6; padding: 1.5rem; max-width: 900px; margin: 0 auto;
+      font-size: 15px;
+    }
+    h1 { font-size: 1.3rem; margin-bottom: 1rem; }
+    h3 { font-size: 1rem; margin: 1.25rem 0 0.5rem; color: #1e40af; }
+    .tabs { display: flex; gap: 0.5rem; margin-bottom: 1rem; flex-wrap: wrap; }
+    .tab {
+      padding: 0.5rem 0.9rem; border: 2px solid var(--border); border-radius: 8px;
+      background: var(--card); cursor: pointer; font-size: 0.88rem;
+    }
+    .tab.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .lesson {
+      background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+      padding: 1rem 1.15rem; margin-bottom: 1rem;
+    }
+    .lesson ol { margin: 0.5rem 0 0 1.25rem; }
+    .lesson li { margin-bottom: 0.65rem; }
+    .lesson li ul { margin: 0.35rem 0 0 1rem; list-style: disc; }
+    .formula {
+      font-family: "SF Mono", Consolas, monospace; font-size: 0.88rem;
+      background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px;
+      padding: 0.5rem 0.75rem; margin: 0.4rem 0; display: block;
+    }
+    .card {
+      background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+      padding: 1rem; margin-bottom: 1rem;
+    }
+    .controls { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; margin-bottom: 0.75rem; font-size: 0.85rem; }
+    .controls button {
+      padding: 0.3rem 0.6rem; border-radius: 6px; border: 1px solid var(--border);
+      background: #fff; cursor: pointer; font: inherit;
+    }
+    .controls button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+    table.mat { border-collapse: collapse; font-family: "SF Mono", Consolas, monospace; font-size: 11px; }
+    table.mat td, table.mat th { width: 40px; height: 30px; text-align: center; border: 1px solid #ccc; }
+    table.mat th { background: #f3f4f6; }
+    .hl { box-shadow: inset 0 0 0 2px var(--partial); font-weight: 700; }
+    .hl-sum { background: #fdf2f8; box-shadow: inset 0 0 0 2px var(--sum); }
+    .w0 { background: var(--w0); } .w1 { background: var(--w1); }
+    .hidden { display: none; }
+    code { font-family: "SF Mono", Consolas, monospace; font-size: 0.9em; background: #f1f5f9; padding: 0.1em 0.3em; border-radius: 3px; }
+    .compare { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
+    @media (max-width: 640px) { .compare { grid-template-columns: 1fr; } }
+    .mini { font-size: 0.75rem; color: var(--muted); margin-bottom: 4px; }
+    .result { background: #f0fdf4; border-left: 4px solid var(--direct); padding: 0.6rem 0.75rem; font-size: 0.88rem; margin-top: 0.5rem; }
+  </style>
+</head>
+<body>
+  <h1>grad_x 能不能也要 partial sum？</h1>
+
+  <div class="tabs">
+    <button type="button" class="tab active" data-mode="row">A · 讲义：按 X 的行切 program</button>
+    <button type="button" class="tab" data-mode="wrow">B · 假想：按 weight 的行切 program</button>
+  </div>
+
+  <!-- ========== A ========== -->
+  <div id="panelRow">
+    <div class="lesson">
+      <p><strong>讲义做的事：</strong>把矩阵 X 的<strong>行</strong>切成两块，开 2 个 program。program 0 只管 X 行 0–1；program 1 只管 X 行 2–3。</p>
+      <p style="margin-top:0.5rem"><code>grad_x[i,j]</code> 只跟 X 的第 <code>i</code> 行有关 → 每个格子只有一个 program 会写 → <strong>直接写进 grad_x，不要 partial</strong>。</p>
+      <p style="margin-top:0.5rem"><code>grad_weight</code> 要把<strong>所有行</strong>的贡献加起来 → 每个 program 只能加自己那几行 → 先写 <code>partial_grad_weight</code>，Python 里再 <code>sum</code>。</p>
+    </div>
+    <div class="controls" id="rowControls">
+      <span>program_id =</span>
+      <button type="button" class="active" data-prog="0">0（X 行 0–1）</button>
+      <button type="button" data-prog="1">1（X 行 2–3）</button>
+    </div>
+    <div class="card">
+      <div class="mini">grad_x：高亮 = 当前 program 写的行</div>
+      <table class="mat" id="gxRow"></table>
+    </div>
+  </div>
+
+  <!-- ========== B：从零讲清 ========== -->
+  <div id="panelW" class="hidden">
+    <div class="lesson">
+      <h3>第 1 步：手里有三张表（先别管 program）</h3>
+      <ol>
+        <li><strong>X</strong>：4 行 × 4 列。行号 <code>i = 0,1,2,3</code>，列号 <code>j = 0,1,2,3</code>。</li>
+        <li><strong>weight</strong>：2 行 × 4 列。
+          <ul>
+            <li>第 0 行：<code>10, 20, 30, 40</code></li>
+            <li>第 1 行：<code>50, 60, 70, 80</code></li>
+          </ul>
+          下面用 <code>weight[0,j]</code> 表示第 0 行第 j 列，<code>weight[1,j]</code> 表示第 1 行第 j 列。
+        </li>
+        <li><strong>y</strong>：4 行 × 2 列。为什么 2 列？因为 weight 有 <strong>2 行</strong>，X 的每一行要算 <strong>2 遍</strong>内积，得到 2 个数。
+          <ul>
+            <li>y 的第 0 列：用 weight 的<strong>第 0 行</strong> 和 X 的某一行相乘再相加</li>
+            <li>y 的第 1 列：用 weight 的<strong>第 1 行</strong> 和 X 的同一行相乘再相加</li>
+          </ul>
+        </li>
+      </ol>
+
+      <h3>第 2 步：前向公式（以 X 的第 0 行为例，i = 0）</h3>
+      <span class="formula">y[0, 第0列] = 1×10 + 2×20 + 3×30 + 4×40 = 300</span>
+      <span class="formula">y[0, 第1列] = 1×50 + 2×60 + 3×70 + 4×80 = 700</span>
+      <p>这里 <code>x[0,0]=1</code> 同时出现在两个式子里：第一个式子系数是 <code>10</code>（weight 第 0 行第 0 列），第二个式子系数是 <code>50</code>（weight 第 1 行第 0 列）。</p>
+
+      <h3>第 3 步：反向时多了一张表 grad_output</h3>
+      <p><strong>grad_output</strong> 和 y <strong>一样大</strong>：4 行 × 2 列。</p>
+      <ul style="margin-left:1.25rem">
+        <li><code>grad_output[i, 0]</code>：如果 <code>y[i, 第0列]</code> 增加 1，loss 增加多少（本例第 0 行是 100）</li>
+        <li><code>grad_output[i, 1]</code>：如果 <code>y[i, 第1列]</code> 增加 1，loss 增加多少（本例第 0 行是 500）</li>
+      </ul>
+
+      <h3>第 4 步：grad_x[i,j] 怎么算（以 i=0, j=0 为例）</h3>
+      <p><code>x[0,0]</code> 只出现在 <code>y[0, 第0列]</code> 和 <code>y[0, 第1列]</code> 两个式子里，所以要<strong>加两项</strong>：</p>
+      <span class="formula">grad_x[0,0] = grad_output[0,0] × weight[0,0]  +  grad_output[0,1] × weight[1,0]</span>
+      <span class="formula">           = 100 × 10  +  500 × 50  =  1000 + 25000  =  26000</span>
+      <p>任意格子都是这个结构：</p>
+      <span class="formula">grad_x[i,j] = grad_output[i,0]×weight[0,j] + grad_output[i,1]×weight[1,j]</span>
+      <p>一共 <strong>两项</strong>。第一项只用 weight 第 0 行 + grad_output 第 0 列；第二项只用 weight 第 1 行 + grad_output 第 1 列。</p>
+
+      <h3>第 5 步：假想——我们故意把两个 program 拆开算这两项</h3>
+      <ul style="margin-left:1.25rem">
+        <li><strong>program 0</strong>：只算第一项 → 存入 <code>partial_grad_x[0, i, j] = grad_output[i,0] × weight[0,j]</code></li>
+        <li><strong>program 1</strong>：只算第二项 → 存入 <code>partial_grad_x[1, i, j] = grad_output[i,1] × weight[1,j]</code></li>
+      </ul>
+      <p>同一个 <code>grad_x[i,j]</code> 被两个 program 各写进缓冲区的一行，<strong>内核里仍不撞车</strong>（写 <code>partial_grad_x[0,...]</code> 和 <code>partial_grad_x[1,...]</code>）。</p>
+      <p>但要得到真正的 <code>grad_x[i,j]</code>，必须在 Python 里：</p>
+      <span class="formula">grad_x[i,j] = partial_grad_x[0,i,j] + partial_grad_x[1,i,j]</span>
+      <p>这就是「grad_x 也要 partial sum」的意思——<strong>不是因为行尾没对齐</strong>，是因为我们<strong>按 weight 的行</strong>把本来该加在一起的两项拆给了两个 program。</p>
+    </div>
+
+    <div class="controls" id="wControls">
+      <span>看哪一列 j：</span>
+      <button type="button" class="active" data-col="0">0</button>
+      <button type="button" data-col="1">1</button>
+      <button type="button" data-col="2">2</button>
+      <button type="button" data-col="3">3</button>
+    </div>
+
+    <div class="card">
+      <div class="mini">固定 j = <span id="jLabel">0</span>。左：program 0 只算 weight 第 0 行那一项；右：program 1 只算 weight 第 1 行那一项</div>
+      <div class="compare">
+        <div>
+          <div class="mini">partial_grad_x[0, i, j] = grad_output[i,0] × weight[0,j]</div>
+          <table class="mat" id="pgx0"></table>
+        </div>
+        <div>
+          <div class="mini">partial_grad_x[1, i, j] = grad_output[i,1] × weight[1,j]</div>
+          <table class="mat" id="pgx1"></table>
+        </div>
+      </div>
+      <div class="mini" style="margin-top:10px">相加后 = grad_x（整表）</div>
+      <table class="mat" id="gxFinal"></table>
+      <div class="result" id="oneCell"></div>
+    </div>
+  </div>
+
+  <script>
+    const X = [[1,2,3,4],[5,6,7,8],[9,10,11,12],[13,14,15,16]];
+    const GO = [[100,500],[200,600],[300,700],[400,800]];
+    const W = [[10,20,30,40],[50,60,70,80]];
+
+    let mode = 'row', prog = 0, col = 0;
+
+    const pgx0 = (i,j) => W[0][j] * GO[i][0];
+    const pgx1 = (i,j) => W[1][j] * GO[i][1];
+    const gx   = (i,j) => pgx0(i,j) + pgx1(i,j);
+
+    function matHtml(rows, cols, fn, hl) {
+      let h = '<tr><th>i\\j</th>';
+      for (let c = 0; c < cols; c++) h += `<th>${c}</th>`;
+      h += '</tr>';
+      for (let r = 0; r < rows; r++) {
+        h += `<tr><th>${r}</th>`;
+        for (let c = 0; c < cols; c++) {
+          h += `<td class="${hl ? hl(r,c) : ''}">${fn(r,c)}</td>`;
+        }
+        h += '</tr>';
+      }
+      return h;
+    }
+
+    function setMode(m) {
+      mode = m;
+      document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.mode === m));
+      document.getElementById('panelRow').classList.toggle('hidden', m !== 'row');
+      document.getElementById('panelW').classList.toggle('hidden', m !== 'wrow');
+      render();
+    }
+
+    function renderRow() {
+      document.getElementById('gxRow').innerHTML = matHtml(4, 4, (i,j) => gx(i,j), (i,j) => {
+        const mine = (prog === 0 && i < 2) || (prog === 1 && i >= 2);
+        return mine ? 'hl' : '';
+      });
+    }
+
+    function renderW() {
+      document.getElementById('jLabel').textContent = col;
+      const hl = (r,c) => c === col ? 'hl' : '';
+      document.getElementById('pgx0').innerHTML = matHtml(4, 4, pgx0, hl);
+      document.getElementById('pgx1').innerHTML = matHtml(4, 4, pgx1, hl);
+      document.getElementById('gxFinal').innerHTML = matHtml(4, 4, gx, (r,c) => c === col ? 'hl-sum' : '');
+
+      const a = pgx0(0, col), b = pgx1(0, col);
+      document.getElementById('oneCell').innerHTML =
+        `<strong>验算 grad_x[0,${col}]</strong><br>` +
+        `= partial[0,0,${col}] + partial[1,0,${col}]<br>` +
+        `= ${W[0][col]}×${GO[0][0]} + ${W[1][col]}×${GO[0][1]}<br>` +
+        `= ${a} + ${b} = <strong>${a+b}</strong>`;
+    }
+
+    function render() {
+      if (mode === 'row') renderRow();
+      else renderW();
+    }
+
+    document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => setMode(t.dataset.mode)));
+    document.getElementById('rowControls').addEventListener('click', e => {
+      const b = e.target.closest('button[data-prog]');
+      if (!b) return;
+      prog = +b.dataset.prog;
+      document.querySelectorAll('#rowControls button').forEach(x => x.classList.toggle('active', +x.dataset.prog === prog));
+      renderRow();
+    });
+    document.getElementById('wControls').addEventListener('click', e => {
+      const b = e.target.closest('button[data-col]');
+      if (!b) return;
+      col = +b.dataset.col;
+      document.querySelectorAll('#wControls button').forEach(x => x.classList.toggle('active', +x.dataset.col === col));
+      renderW();
+    });
+
+    render();
+  </script>
+</body>
+</html>

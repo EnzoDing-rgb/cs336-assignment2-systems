@@ -38,6 +38,7 @@ def run_sweep(
     seed: int = DEFAULT_SEED,
     device: torch.device | None = None,
     extend_for_oom: bool = True,
+    use_compile: bool = False,
 ) -> list[BenchmarkResult]:
     if device is None:
         device = torch.device("cuda")
@@ -53,8 +54,10 @@ def run_sweep(
             warmup=warmup,
             iters=iters,
             seed=seed,
+            use_compile=use_compile,
         )
-        print(f"  d={d} S={s} …", flush=True)
+        label = "compiled" if use_compile else "eager"
+        print(f"  [{label}] d={d} S={s} …", flush=True)
         result = benchmark_cell(cfg, device)
         if result.oom:
             print("    OOM", flush=True)
@@ -66,7 +69,7 @@ def run_sweep(
             )
         results.append(result)
 
-    if extend_for_oom and not any(r.oom for r in results):
+    if extend_for_oom and not use_compile and not any(r.oom for r in results):
         print("── No OOM in base grid; extending S for d=128 ──", flush=True)
         for s in EXTRA_S_IF_NO_OOM:
             cfg = AttentionBenchmarkConfig(
@@ -76,6 +79,7 @@ def run_sweep(
                 warmup=warmup,
                 iters=iters,
                 seed=seed,
+                use_compile=use_compile,
             )
             print(f"  d=128 S={s} …", flush=True)
             result = benchmark_cell(cfg, device)

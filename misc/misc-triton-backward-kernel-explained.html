@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>weighted_sum_backward 内核导读</title>
+  <style>
+    :root {
+      --bg: #f8fafc;
+      --card: #fff;
+      --text: #0f172a;
+      --muted: #64748b;
+      --accent: #2563eb;
+      --accent2: #7c3aed;
+      --ok: #059669;
+      --warn: #d97706;
+      --line: #e2e8f0;
+      --code-bg: #1e293b;
+      --comment: #94a3b8;
+      --hl: #fbbf24;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.55;
+      padding: 1.25rem 1.5rem 2.5rem;
+      max-width: 1060px;
+      margin: 0 auto;
+    }
+    h1 { font-size: 1.4rem; margin-bottom: 0.3rem; }
+    .sub { color: var(--muted); font-size: 0.9rem; margin-bottom: 1.25rem; }
+    section {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 1.1rem 1.25rem;
+      margin-bottom: 1rem;
+      box-shadow: 0 1px 2px rgba(15,23,42,0.05);
+    }
+    section h2 {
+      font-size: 0.95rem;
+      margin-bottom: 0.65rem;
+      color: var(--accent);
+    }
+    .qa {
+      border-left: 4px solid var(--accent2);
+      background: linear-gradient(90deg, #f5f3ff, #fff);
+      padding: 0.85rem 1rem;
+      margin: 0.65rem 0;
+      border-radius: 0 8px 8px 0;
+      font-size: 0.88rem;
+    }
+    .qa b { color: var(--accent2); }
+    .three-col {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 0.75rem;
+      margin: 0.75rem 0;
+    }
+    @media (max-width: 800px) { .three-col { grid-template-columns: 1fr; } }
+    .term-card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 0.75rem;
+      font-size: 0.82rem;
+    }
+    .term-card .name {
+      font-family: "SF Mono", Consolas, monospace;
+      font-weight: 700;
+      color: var(--accent);
+      font-size: 0.9rem;
+      margin-bottom: 0.35rem;
+    }
+    .term-card .val {
+      display: inline-block;
+      background: #eff6ff;
+      color: #1d4ed8;
+      padding: 0.1rem 0.4rem;
+      border-radius: 4px;
+      font-family: monospace;
+      font-size: 0.8rem;
+      margin-top: 0.25rem;
+    }
+    .diagram {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+      font-size: 0.8rem;
+      margin: 0.75rem 0;
+    }
+    .box {
+      border: 2px solid var(--line);
+      border-radius: 8px;
+      padding: 0.5rem 0.75rem;
+      background: #fff;
+      text-align: center;
+      min-width: 100px;
+    }
+    .box.launch { border-color: var(--accent); background: #eff6ff; }
+    .box.prog { border-color: var(--ok); background: #ecfdf5; }
+    .box.buf { border-color: var(--warn); background: #fffbeb; }
+    .arrow { color: var(--muted); font-size: 1.1rem; }
+    table.mem {
+      border-collapse: collapse;
+      font-family: "SF Mono", Consolas, monospace;
+      font-size: 11px;
+      margin: 0.5rem 0;
+    }
+    table.mem td, table.mem th {
+      border: 1px solid #cbd5e1;
+      padding: 6px 10px;
+      text-align: center;
+    }
+    table.mem th { background: #f1f5f9; }
+    .row-x { background: #dbeafe; }
+    .row-p0 { background: #dcfce7; }
+    .row-p1 { background: #ffedd5; }
+    .code-wrap {
+      background: var(--code-bg);
+      border-radius: 10px;
+      overflow: hidden;
+      margin-top: 0.75rem;
+    }
+    pre {
+      margin: 0;
+      padding: 1rem 1.1rem;
+      overflow-x: auto;
+      font-family: "SF Mono", "Cascadia Code", Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.65;
+      color: #e2e8f0;
+    }
+    .c { color: var(--comment); font-style: italic; }
+    .k { color: #c084fc; }
+    .f { color: #7dd3fc; }
+    .s { color: #86efac; }
+    .n { color: #fcd34d; }
+    .hl-line { background: rgba(251,191,36,0.12); display: block; margin: 0 -1.1rem; padding: 0 1.1rem; }
+    .inplace {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.75rem;
+      font-size: 0.82rem;
+    }
+    @media (max-width: 700px) { .inplace { grid-template-columns: 1fr; } }
+    .inplace .yes { border: 1px solid #86efac; background: #f0fdf4; border-radius: 8px; padding: 0.65rem; }
+    .inplace .no { border: 1px solid #fcd34d; background: #fffbeb; border-radius: 8px; padding: 0.65rem; }
+    .slider-row {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      margin: 0.5rem 0;
+      font-size: 0.85rem;
+    }
+    input[type=range] { flex: 1; max-width: 200px; }
+    code {
+      font-family: "SF Mono", Consolas, monospace;
+      font-size: 0.88em;
+      background: #f1f5f9;
+      padding: 0.1em 0.35em;
+      border-radius: 3px;
+    }
+  </style>
+</head>
+<body>
+  <h1><code>weighted_sum_backward</code> 内核导读</h1>
+  <p class="sub">先弄清 launch grid → program_id → 缓冲区下标；再读代码。本页用 NUM_ROWS=4, ROWS_TILE_SIZE=2, D=4 作例。</p>
+
+  <!-- Step 0: in-place intuition -->
+  <section>
+    <h2>0 · 你说的「in-place 加」和 partial 的关系</h2>
+    <div class="inplace">
+      <div class="yes">
+        <strong>写到不同地址 → 内核里不撞车</strong><br>
+        <code>grad_x</code>：program 0 写行 0–1，program 1 写行 2–3 → 各写各的格子，<strong>直写最终缓冲区</strong>。<br>
+        <code>partial_grad_weight</code>：program 0 写缓冲区<strong>第 0 行</strong>，program 1 写<strong>第 1 行</strong> → 内核里也不撞车。
+      </div>
+      <div class="no">
+        <strong>写的是「部分和」，不是最终答案 → 内核外还要 reduce</strong><br>
+        <code>partial_grad_weight[0,j]</code> 只含 X 行 0–1 对 <code>grad_weight[j]</code> 的贡献；<br>
+        <code>partial_grad_weight[1,j]</code> 只含行 2–3。要得到真正的 <code>grad_weight[j]</code>，必须在 Python 里 <code>sum(axis=0)</code>。<br>
+        <em>这不是因为两 program 往同一地址 atomic 加，而是因为故意分了「部分和槽位」。</em>
+      </div>
+    </div>
+  </section>
+
+  <!-- Step 1: three questions -->
+  <section>
+    <h2>1 · 三个名词（先读这里）</h2>
+
+    <div class="three-col">
+      <div class="term-card">
+        <div class="name">n_row_tiles</div>
+        把矩阵 <strong>X 的行方向</strong> 切成几块，<strong>一共几块</strong>。<br>
+        <strong>不是</strong> X 里的某一行号；是「行块的总个数」。<br>
+        <span class="val">本例 = cdiv(4, 2) = 2</span>
+      </div>
+      <div class="term-card">
+        <div class="name">row_tile_idx</div>
+        = <code>tl.program_id(0)</code>：当前这个 program 负责<strong>第几块行块</strong>（从 0 编号）。<br>
+        本例只有 0 和 1 → 手算里的「实例 0 / 实例 1」。<br>
+        <span class="val">0 → X 行 0–1；1 → X 行 2–3</span>
+      </div>
+      <div class="term-card">
+        <div class="name">tl.num_programs(0)</div>
+        launch 时 grid 第 0 维的长度 = 一共起了几个 program。<br>
+        Python 写 <code>[(n_row_tiles,)]</code>，所以这里<strong>恒等于</strong> <code>n_row_tiles</code>。<br>
+        <span class="val">本例 = 2</span>
+      </div>
+    </div>
+
+    <div class="qa">
+      <b>Q：n_row_tiles 到底是哪个 row？</b><br>
+      A：哪个都不是。它是<strong>计数</strong>：行方向被 tile 切成了几块。类比：一条 4 米长的面包切成 2 段，<code>n_row_tiles=2</code> 说的是「有 2 段」，不是说「第 2 行面包屑」。
+    </div>
+    <div class="qa">
+      <b>Q：row_tile_idx 就是实例 0 / 1 吗？</b><br>
+      A：在本例（2 个 program）里，<strong>是</strong>。<code>row_tile_idx=0</code> 就是第 0 个 program（管行 0–1），<code>=1</code> 是第 1 个 program（管行 2–3）。一般情况可有 0…n_row_tiles−1。
+    </div>
+    <div class="qa">
+      <b>Q：为什么 num_programs(0) == n_row_tiles？</b><br>
+      A：因为<strong>你 launch 时就按这个数起的 program 个数</strong>：<code>weighted_sum_backward[(n_row_tiles,)]</code>。Triton 在轴 0 上启动 <code>n_row_tiles</code> 份内核副本；<code>num_programs(0)</code> 只是把这同一个数字读回来，用来声明 <code>partial_grad_weight</code> 第 0 维有多大。
+    </div>
+  </section>
+
+  <!-- Step 2: launch diagram -->
+  <section>
+    <h2>2 · 从 Python launch 到每个 program 读哪几行</h2>
+    <div class="diagram">
+      <div class="box launch">Python<br><code>[(2,)]</code><br>grid 轴0 长度=2</div>
+      <span class="arrow">→</span>
+      <div class="box prog">program_id(0)=0<br><code>row_tile_idx=0</code><br>行 0–1</div>
+      <div class="box prog">program_id(0)=1<br><code>row_tile_idx=1</code><br>行 2–3</div>
+    </div>
+
+    <div class="slider-row">
+      <label>拖动看当前 program：<code>row_tile_idx</code> = <strong id="pidVal">0</strong></label>
+      <input type="range" id="pidSlider" min="0" max="1" value="0" />
+    </div>
+
+    <table class="mem">
+      <tr><th></th><th>列0</th><th>列1</th><th>列2</th><th>列3</th><th>谁读这块行</th></tr>
+      <tr id="xr0"><th>行0</th><td>1</td><td>2</td><td>3</td><td>4</td><td rowspan="2" id="owner0">program 0</td></tr>
+      <tr id="xr1"><th>行1</th><td>5</td><td>6</td><td>7</td><td>8</td></tr>
+      <tr id="xr2"><th>行2</th><td>9</td><td>10</td><td>11</td><td>12</td><td rowspan="2" id="owner1">program 1</td></tr>
+      <tr id="xr3"><th>行3</th><td>13</td><td>14</td><td>15</td><td>16</td></tr>
+    </table>
+    <p style="font-size:0.82rem;color:var(--muted);margin-top:0.5rem">
+      块指针 <code>offsets=(row_tile_idx * ROWS_TILE_SIZE, …)</code>：idx=0 从行 0 起；idx=1 从行 2 起。
+    </p>
+  </section>
+
+  <!-- Step 3: partial buffer -->
+  <section>
+    <h2>3 · partial_grad_weight 的第 0 维 = 行块号（不是 X 的行号）</h2>
+    <table class="mem">
+      <tr><th>partial_grad_weight[?, j]</th><th>列0</th><th>列1</th><th>列2</th><th>列3</th><th>含义</th></tr>
+      <tr class="row-p0"><th>行块 0</th><td>…</td><td>…</td><td>…</td><td>…</td><td>只累加 X 行 0–1</td></tr>
+      <tr class="row-p1"><th>行块 1</th><td>…</td><td>…</td><td>…</td><td>…</td><td>只累加 X 行 2–3</td></tr>
+      <tr style="background:#fdf2f8"><th>sum ↓</th><td colspan="4"><code>grad_weight[j] = partial[0,j] + partial[1,j]</code></td><td>Python，内核外</td></tr>
+    </table>
+    <p style="font-size:0.82rem;margin-top:0.5rem">
+      <code>shape=(n_row_tiles, D)</code> 里 <code>n_row_tiles</code> 来自 <code>num_programs(0)</code>，就是为「每个行块留一行部分和」。
+      <code>offsets=(row_tile_idx, 0)</code> 保证 program 0 只写第 0 行槽位，program 1 只写第 1 行槽位。
+    </p>
+  </section>
+
+  <!-- Step 4: annotated code -->
+  <section>
+    <h2>4 · 带 inline 注释的完整内核（高亮随 slider 变化）</h2>
+    <div class="code-wrap">
+<pre id="codeBlock"></pre>
+    </div>
+  </section>
+
+  <script>
+    const pidSlider = document.getElementById('pidSlider');
+    const pidVal = document.getElementById('pidVal');
+
+    function highlightRows(pid) {
+      for (let r = 0; r < 4; r++) {
+        const row = document.getElementById('xr' + r);
+        row.className = '';
+        if ((pid === 0 && r < 2) || (pid === 1 && r >= 2)) row.classList.add('row-x');
+      }
+      document.getElementById('owner0').style.fontWeight = pid === 0 ? '700' : '400';
+      document.getElementById('owner1').style.fontWeight = pid === 1 ? '700' : '400';
+    }
+
+    function renderCode(pid) {
+      const rowStart = pid * 2;
+      const code = `
+<span class="k">@triton.jit</span>
+<span class="k">def</span> <span class="f">weighted_sum_backward</span>(...):
+    <span class="hl-line">    <span class="c"># row_tile_idx：我是第几块「行 tile」？= launch grid 轴0 上的编号</span>
+    <span class="c">    # 本例 pid=0 → 实例0，管 X 行 0–1；pid=1 → 实例1，管行 2–3</span>
+    row_tile_idx = tl.program_id(<span class="n">0</span>)   <span class="c"># 当前值：${pid}</span>
+
+    <span class="c">    # n_row_tiles：行方向一共切了几块（不是 X 的某一行的下标）</span>
+    <span class="c">    # = Python launch 的 grid 长度 = cdiv(NUM_ROWS, ROWS_TILE_SIZE) = 2</span>
+    n_row_tiles = tl.num_programs(<span class="n">0</span>)   <span class="c"># 恒等于 launch [(n_row_tiles,)] 里的那个数</span></span>
+
+    grad_output_block_ptr = tl.make_block_ptr(
+        ...,
+        offsets=(row_tile_idx * ROWS_TILE_SIZE,),  <span class="c"># ${pid}*2=${rowStart} → 从 X 行 ${rowStart} 读 grad</span>
+        block_shape=(ROWS_TILE_SIZE,),             <span class="c"># 每次读 2 个行方向标量</span>
+    )
+    x_block_ptr = tl.make_block_ptr(
+        ...,
+        offsets=(row_tile_idx * ROWS_TILE_SIZE, <span class="n">0</span>),  <span class="c"># 同样从 X 行 ${rowStart} 起</span>
+        block_shape=(ROWS_TILE_SIZE, D_TILE_SIZE),
+    )
+
+    grad_x_block_ptr = tl.make_block_ptr(
+        ...,
+        offsets=(row_tile_idx * ROWS_TILE_SIZE, <span class="n">0</span>),  <span class="c"># 写 grad_x 的同一块行 → 各 pid 写不同行，直写最终张量</span>
+    )
+
+    partial_grad_weight_block_ptr = tl.make_block_ptr(
+        partial_grad_weight_ptr,
+        shape=(n_row_tiles, D),        <span class="c"># 第0维长度=2：给每个「行块」一行槽位</span>
+        offsets=(row_tile_idx, <span class="n">0</span>),       <span class="c"># pid=${pid} 只写 partial 的第 ${pid} 行（不是 X 行 ${rowStart}！）</span>
+        block_shape=(<span class="n">1</span>, D_TILE_SIZE),
+    )
+
+    <span class="k">for</span> i <span class="k">in</span> range(tl.cdiv(D, D_TILE_SIZE)):
+        grad_x_row = grad_output[:, <span class="k">None</span>] * weight[<span class="k">None</span>, :]
+        tl.store(grad_x_block_ptr, grad_x_row)     <span class="c"># 最终 grad_x，无 partial</span>
+
+        grad_weight_row = tl.sum(row * grad_output[:, <span class="k">None</span>], axis=<span class="n">0</span>, keep_dims=<span class="k">True</span>)
+        tl.store(partial_grad_weight_block_ptr, grad_weight_row)  <span class="c"># 只写本行块的部分和</span>
+        <span class="c">        # ... advance 列条带 ...</span>
+
+    <span class="c">    # 内核结束。没有 partial[0]+partial[1] —— 在 Python：</span>
+    <span class="c">    # grad_weight = partial_grad_weight.sum(axis=0)</span>`;
+      document.getElementById('codeBlock').innerHTML = code.trim();
+    }
+
+    pidSlider.addEventListener('input', () => {
+      const pid = +pidSlider.value;
+      pidVal.textContent = pid;
+      highlightRows(pid);
+      renderCode(pid);
+    });
+
+    highlightRows(0);
+    renderCode(0);
+  </script>
+</body>
+</html>
