@@ -2,14 +2,14 @@
 
 实验 A（主对比）
   naive attention / flash_pytorch / flash_triton
-  两版 Flash 使用相同 heuristic tile（_choose_flash_tiles）
+  两版 Flash 短序列用同一套默认分块（_choose_flash_tiles 按 S、d 查表）
   同轮测量 forward / backward / e2e
   网格：S × d × {fp32, bf16}，B=1，causal=True
 
 实验 B（tile 消融）
   仅 flash_pytorch vs flash_triton
   固定若干 (S, d)、fp32
-  tile ∈ {(16,16),(32,32),(64,64),(128,128),heuristic}
+  tile ∈ {(16,16),(32,32),(64,64),(128,128),默认分块}
   同轮 fwd / bwd / e2e —— 看加大 tile 对 PyTorch 能补多少、Triton 大 tile 是否挂
 """
 
@@ -115,7 +115,7 @@ def _make_inputs(seq_len: int, d_model: int, dtype: torch.dtype, requires_grad: 
 def _resolve_tiles(seq_len: int, d_model: int, tile: tuple[int, int] | None) -> tuple[int, int, str]:
     if tile is None:
         bq, bk = _choose_flash_tiles(seq_len, d_model)
-        return bq, bk, f"heuristic({bq}x{bk})"
+        return bq, bk, f"{bq}x{bk}"
     bq, bk = tile
     return bq, bk, f"{bq}x{bk}"
 
@@ -326,7 +326,7 @@ def run_tile_ablation(smoke: bool = False) -> list[CellResult]:
         for tile in tile_map[(seq_len, d_model)]:
             for impl in impls:
                 done += 1
-                label = "heuristic" if tile is None else f"{tile[0]}x{tile[1]}"
+                label = "默认" if tile is None else f"{tile[0]}x{tile[1]}"
                 print(
                     f"[{done}/{total}] tile {impl} S={seq_len} d={d_model} tile={label} ...",
                     flush=True,
@@ -344,14 +344,27 @@ def run_tile_ablation(smoke: bool = False) -> list[CellResult]:
 
 
 # ---------------------------------------------------------------------------
-# Plotting — grouped bar charts
+# Plotting — grouped bar charts (6 bars: 3 impl × {fp32, bf16})
 # ---------------------------------------------------------------------------
 
-_IMPL_BAR = {
-    IMPL_NAIVE: dict(color="#4C78A8", label="naive attention"),
-    IMPL_PT: dict(color="#F58518", label="flash_pytorch"),
-    IMPL_TRITON: dict(color="#54A24B", label="flash_triton"),
+_IMPL_COLORS = {
+    IMPL_NAIVE: ("#4C78A8", "#9ECAE1"),   # fp32 dark, bf16 light
+    IMPL_PT: ("#F58518", "#FDBB84"),
+    IMPL_TRITON: ("#54A24B", "#A1D99B"),
 }
+_IMPL_LABEL = {
+    IMPL_NAIVE: "naive",
+    IMPL_PT: "flash_pytorch",
+    IMPL_TRITON: "flash_triton",
+}
+_SERIES_ORDER = [
+    (IMPL_NAIVE, "fp32"),
+    (IMPL_NAIVE, "bf16"),
+    (IMPL_PT, "fp32"),
+    (IMPL_PT, "bf16"),
+    (IMPL_TRITON, "fp32"),
+    (IMPL_TRITON, "bf16"),
+]
 
 
 def _main_rows(rows: list[dict]) -> list[dict]:
@@ -391,52 +404,55 @@ def _lookup_ms(
     return val
 
 
-def _grouped_bars(
+def _grouped_bars_6(
     ax,
     x_labels: list[str],
-    series: dict[str, list[float | None]],
+    series: dict[tuple[str, str], list[float | None]],
     ylabel: str,
     title: str,
-    estimated: dict[str, list[bool]] | None = None,
+    estimated: dict[tuple[str, str], list[bool]] | None = None,
 ) -> None:
+    """Six bars per x: naive/pytorch/triton × fp32/bf16."""
     import numpy as np
 
     n = len(x_labels)
     x = np.arange(n, dtype=float)
-    n_impl = len(MAIN_IMPLS)
-    width = min(0.25, 0.8 / n_impl)
-    offsets = (np.arange(n_impl) - (n_impl - 1) / 2.0) * width
+    n_series = len(_SERIES_ORDER)
+    width = min(0.13, 0.88 / n_series)
+    offsets = (np.arange(n_series) - (n_series - 1) / 2.0) * width
     labeled: set[str] = set()
     est_labeled = False
-    for i, impl in enumerate(MAIN_IMPLS):
-        style = _IMPL_BAR[impl]
-        for j, y in enumerate(series[impl]):
+    for i, (impl, dtype) in enumerate(_SERIES_ORDER):
+        c_fp, c_bf = _IMPL_COLORS[impl]
+        color = c_fp if dtype == "fp32" else c_bf
+        key = (impl, dtype)
+        leg = f"{_IMPL_LABEL[impl]} {dtype}"
+        for j, y in enumerate(series[key]):
             if y is None:
                 continue
-            is_est = bool(estimated and estimated.get(impl) and estimated[impl][j])
-            lab = style["label"] if impl not in labeled else None
+            is_est = bool(estimated and estimated.get(key) and estimated[key][j])
+            lab = leg if leg not in labeled else None
             ax.bar(
                 x[j] + offsets[i],
                 y,
                 width=width * 0.92,
-                color=style["color"],
-                alpha=0.45 if is_est else 1.0,
+                color=color,
+                alpha=0.5 if is_est else 1.0,
                 hatch="///" if is_est else None,
                 edgecolor="#333333" if is_est else "white",
-                linewidth=0.5 if is_est else 0.4,
+                linewidth=0.5 if is_est else 0.35,
                 label=lab,
             )
-            labeled.add(impl)
+            labeled.add(leg)
             if is_est and not est_labeled:
-                # invisible proxy for legend entry
                 ax.bar(
                     [],
                     [],
                     color="#888888",
-                    alpha=0.45,
+                    alpha=0.5,
                     hatch="///",
                     edgecolor="#333333",
-                    label="estimated (hatched)",
+                    label="estimated",
                 )
                 est_labeled = True
     ax.set_xticks(x)
@@ -446,11 +462,11 @@ def _grouped_bars(
     ax.set_yscale("log")
     ax.set_axisbelow(True)
     ax.grid(True, axis="y", alpha=0.35, linestyle="--")
-    ax.legend(frameon=True, fancybox=False, edgecolor="#cccccc", fontsize=8)
+    ax.legend(frameon=True, fancybox=False, edgecolor="#cccccc", fontsize=7, ncol=2)
 
 
 def make_figures(rows: list[dict]) -> list[Path]:
-    """Grouped bars: at each x, naive / flash_pytorch / flash_triton side by side."""
+    """Wide grouped bars: at each x, 6 bars = 3 impl × {fp32, bf16}."""
     import numpy as np
 
     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
@@ -459,7 +475,7 @@ def make_figures(rows: list[dict]) -> list[Path]:
             "font.size": 11,
             "axes.titlesize": 12,
             "axes.labelsize": 11,
-            "legend.fontsize": 8,
+            "legend.fontsize": 7,
             "figure.facecolor": "white",
             "axes.facecolor": "#fafafa",
         }
@@ -475,37 +491,37 @@ def make_figures(rows: list[dict]) -> list[Path]:
         ("backward_ms", "latency (ms)", "flash_bench_backward_vs_seq.png", "Backward"),
         ("e2e_ms", "latency (ms)", "flash_bench_e2e_vs_seq.png", "Forward + backward"),
     ):
-        fig, axes = plt.subplots(1, 2, figsize=(14.5, 5.0), sharey=True)
-        for ax, dtype in zip(axes, ("fp32", "bf16")):
-            series: dict[str, list[float | None]] = {}
-            est_flags: dict[str, list[bool]] = {}
-            for impl in MAIN_IMPLS:
-                vals: list[float | None] = []
-                flags: list[bool] = []
-                for s in seqs_for_bars:
-                    v, e = _lookup_cell(
-                        main, impl=impl, dtype=dtype, metric=metric, d_model=focus_d, seq_len=s
-                    )
-                    vals.append(v)
-                    flags.append(e)
-                series[impl] = vals
-                est_flags[impl] = flags
-            _grouped_bars(
-                ax,
-                [str(s) for s in seqs_for_bars],
-                series,
-                ylab,
-                f"{title} · d={focus_d} · {dtype}",
-                estimated=est_flags,
-            )
-            ax.set_xlabel("sequence length $S$")
+        # One wide panel: 6 bars per S so fp32/bf16 sit together
+        fig, ax = plt.subplots(1, 1, figsize=(20.0, 5.6))
+        series: dict[tuple[str, str], list[float | None]] = {}
+        est_flags: dict[tuple[str, str], list[bool]] = {}
+        for impl, dtype in _SERIES_ORDER:
+            vals: list[float | None] = []
+            flags: list[bool] = []
+            for s in seqs_for_bars:
+                v, e = _lookup_cell(
+                    main, impl=impl, dtype=dtype, metric=metric, d_model=focus_d, seq_len=s
+                )
+                vals.append(v)
+                flags.append(e)
+            series[(impl, dtype)] = vals
+            est_flags[(impl, dtype)] = flags
+        _grouped_bars_6(
+            ax,
+            [str(s) for s in seqs_for_bars],
+            series,
+            ylab,
+            f"{title} · d={focus_d} · 6 bars = impl × dtype",
+            estimated=est_flags,
+        )
+        ax.set_xlabel("sequence length $S$")
         fig.suptitle(
-            f"Grouped bars · d={focus_d} · solid=measured · hatched=estimated · gap=OOM/missing · log y",
+            "solid=measured · hatched=estimated · gap=OOM/missing · log y · wide layout for 6 bars",
             fontsize=9,
             y=1.02,
         )
         out = FIGURES_DIR / fname
-        fig.savefig(out, dpi=180, bbox_inches="tight")
+        fig.savefig(out, dpi=160, bbox_inches="tight")
         plt.close(fig)
         paths.append(out)
 
@@ -514,37 +530,36 @@ def make_figures(rows: list[dict]) -> list[Path]:
         ("backward_ms", "latency (ms)", "flash_bench_backward_vs_d.png", "Backward"),
         ("e2e_ms", "latency (ms)", "flash_bench_e2e_vs_d.png", "Forward + backward"),
     ):
-        fig, axes = plt.subplots(1, 3, figsize=(14.5, 4.6), sharey=True)
+        fig, axes = plt.subplots(1, 3, figsize=(20.0, 5.0), sharey=True)
         for ax, S in zip(axes, seqs_for_d_plot):
-            series: dict[str, list[float | None]] = {}
-            est_flags: dict[str, list[bool]] = {}
-            for impl in MAIN_IMPLS:
-                vals: list[float | None] = []
-                flags: list[bool] = []
+            series = {}
+            est_flags = {}
+            for impl, dtype in _SERIES_ORDER:
+                vals, flags = [], []
                 for d in D_MODEL:
                     v, e = _lookup_cell(
-                        main, impl=impl, dtype="fp32", metric=metric, d_model=d, seq_len=S
+                        main, impl=impl, dtype=dtype, metric=metric, d_model=d, seq_len=S
                     )
                     vals.append(v)
                     flags.append(e)
-                series[impl] = vals
-                est_flags[impl] = flags
-            _grouped_bars(
+                series[(impl, dtype)] = vals
+                est_flags[(impl, dtype)] = flags
+            _grouped_bars_6(
                 ax,
                 [str(d) for d in D_MODEL],
                 series,
                 ylab,
-                f"{title} · S={S} · fp32",
+                f"{title} · S={S}",
                 estimated=est_flags,
             )
             ax.set_xlabel("embedding dim $d$")
         fig.suptitle(
-            "Grouped bars · fp32 · solid=measured · hatched=estimated · gap=OOM/missing · log y",
+            "6 bars = impl × {fp32,bf16} · solid=measured · hatched=estimated · gap=OOM/missing · log y",
             fontsize=9,
             y=1.03,
         )
         out = FIGURES_DIR / fname
-        fig.savefig(out, dpi=180, bbox_inches="tight")
+        fig.savefig(out, dpi=160, bbox_inches="tight")
         plt.close(fig)
         paths.append(out)
 
@@ -573,7 +588,7 @@ def make_figures(rows: list[dict]) -> list[Path]:
                     return float(r[metric])
             return None
 
-        fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.4))
+        fig, axes = plt.subplots(1, 3, figsize=(16.0, 4.6))
         for ax, (metric, title) in zip(
             axes,
             (("forward_ms", "Forward"), ("backward_ms", "Backward"), ("e2e_ms", "Forward + backward")),
@@ -581,7 +596,7 @@ def make_figures(rows: list[dict]) -> list[Path]:
             x = np.arange(len(bqs), dtype=float)
             width = 0.35
             for i, impl in enumerate((IMPL_PT, IMPL_TRITON)):
-                style = _IMPL_BAR[impl]
+                c_fp, _ = _IMPL_COLORS[impl]
                 plotted = False
                 for j, bq in enumerate(bqs):
                     y = tile_ms(impl, bq, metric)
@@ -591,10 +606,10 @@ def make_figures(rows: list[dict]) -> list[Path]:
                         x[j] + (i - 0.5) * width,
                         y,
                         width=width * 0.9,
-                        color=style["color"],
+                        color=c_fp,
                         edgecolor="white",
                         linewidth=0.4,
-                        label=style["label"] if not plotted else None,
+                        label=_IMPL_LABEL[impl] if not plotted else None,
                     )
                     plotted = True
             ax.set_xticks(x)
@@ -612,7 +627,7 @@ def make_figures(rows: list[dict]) -> list[Path]:
             y=1.03,
         )
         out = FIGURES_DIR / "flash_bench_tile_ablation.png"
-        fig.savefig(out, dpi=180, bbox_inches="tight")
+        fig.savefig(out, dpi=160, bbox_inches="tight")
         plt.close(fig)
         paths.append(out)
 
@@ -800,7 +815,7 @@ def write_report(rows: list[dict], figure_paths: list[Path]) -> None:
             "预期：flash_pytorch 随 tile 增大而明显变快（循环次数↓、单次 GEMM 更大），"
             "但通常仍到不了同 tile 的 Triton；"
             "Triton 在过大 tile 上可能直接 OOM/编译失败（shared memory），"
-            "此时 heuristic 的意义是「能跑且较快」而非「数学上最大 tile」。"
+            "此时「默认分块」的意义是「能跑且较快」而非「数学上最大 tile」。"
         )
         lines.append("")
         lines.append("| S | d | tile | flash_pytorch fwd/bwd/e2e | flash_triton fwd/bwd/e2e |")
