@@ -1,0 +1,623 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ZeRO 技术说明（数字例子）</title>
+<style>
+  :root {
+    --bg: #f6f4ef;
+    --ink: #1c1b19;
+    --muted: #5c574e;
+    --line: #d9d2c5;
+    --card: #fffdf8;
+    --accent: #0f5c4c;
+    --accent2: #8b3a2a;
+    --chip: #e8e2d6;
+    --ok: #dceee8;
+    --warn: #f3e6d8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "IBM Plex Sans", "Noto Sans SC", "Segoe UI", sans-serif;
+    color: var(--ink);
+    background:
+      radial-gradient(900px 400px at 10% -10%, #e7efe9 0%, transparent 55%),
+      radial-gradient(700px 360px at 100% 0%, #f0e7dc 0%, transparent 50%),
+      var(--bg);
+    line-height: 1.55;
+  }
+  .wrap {
+    max-width: 980px;
+    margin: 0 auto;
+    padding: 40px 20px 80px;
+  }
+  h1 {
+    font-family: "Iowan Old Style", "Source Han Serif SC", "Noto Serif SC", Georgia, serif;
+    font-weight: 600;
+    font-size: 2rem;
+    letter-spacing: -0.02em;
+    margin: 0 0 8px;
+  }
+  .lede {
+    color: var(--muted);
+    font-size: 1.05rem;
+    max-width: 42em;
+    margin-bottom: 28px;
+  }
+  h2 {
+    font-family: "Iowan Old Style", "Source Han Serif SC", Georgia, serif;
+    font-size: 1.45rem;
+    margin: 42px 0 12px;
+    padding-top: 8px;
+    border-top: 1px solid var(--line);
+  }
+  h3 { font-size: 1.08rem; margin: 22px 0 10px; color: var(--accent); }
+  p, li { max-width: 46em; }
+  .note {
+    background: var(--warn);
+    border-left: 4px solid var(--accent2);
+    padding: 10px 14px;
+    margin: 14px 0 18px;
+    font-size: 0.95rem;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--card);
+    margin: 12px 0 18px;
+    font-size: 0.92rem;
+  }
+  th, td {
+    border: 1px solid var(--line);
+    padding: 8px 10px;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: var(--chip); }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+    margin: 12px 0 16px;
+  }
+  @media (min-width: 800px) {
+    .grid.gpus { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  }
+  @media (max-width: 700px) {
+    .grid { grid-template-columns: 1fr; }
+  }
+  .gpu {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 10px 12px;
+    min-height: 88px;
+  }
+  .gpu .tag {
+    display: inline-block;
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    background: var(--chip);
+    padding: 2px 7px;
+    border-radius: 999px;
+    margin-bottom: 8px;
+  }
+  .gpu code, .vec {
+    font-family: "IBM Plex Mono", "SF Mono", ui-monospace, monospace;
+    font-size: 0.86rem;
+    word-break: break-all;
+  }
+  .panel {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 14px 16px;
+    margin: 12px 0 18px;
+  }
+  .arrow {
+    text-align: center;
+    color: var(--accent);
+    font-weight: 600;
+    margin: 6px 0;
+    font-size: 0.95rem;
+  }
+  .after .gpu { background: var(--ok); }
+  .muted { color: var(--muted); font-size: 0.92rem; }
+  .pill {
+    display: inline-block;
+    background: var(--chip);
+    padding: 2px 8px;
+    border-radius: 6px;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.85rem;
+  }
+  nav.toc {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 14px 18px;
+    margin-bottom: 28px;
+  }
+  nav.toc a {
+    color: var(--accent);
+    text-decoration: none;
+    margin-right: 14px;
+    font-size: 0.92rem;
+  }
+  nav.toc a:hover { text-decoration: underline; }
+  .compare td:nth-child(1) { white-space: nowrap; font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>ZeRO 技术说明</h1>
+  <p class="lede">用 4 张卡、小数组把通信和分片跑一遍。无动画。看「开始每卡有什么 → 结束每卡有什么」。</p>
+
+  <nav class="toc">
+    <a href="#scene">场景</a>
+    <a href="#comms">通信算子</a>
+    <a href="#ddp">朴素 DDP</a>
+    <a href="#s1">ZeRO-1 / P<sub>os</sub></a>
+    <a href="#s23">Stage 2/3</a>
+    <a href="#hw">作业实现</a>
+    <a href="#core-diff">核心差异：对齐 W</a>
+    <a href="#cmp">对照表</a>
+    <a href="#bw">流量 / 带宽怎么算</a>
+  </nav>
+
+  <h2 id="scene">0. 共用玩具场景</h2>
+  <div class="panel">
+    <p><span class="pill">4 GPU</span> rank 0–3 &nbsp;|&nbsp; 权重拍扁成 <span class="pill">W = [w0…w7]</span>（8 个数）</p>
+    <p class="muted">Adam 粗算：每卡若存全套，大约还有完整的 <code>m[8]</code>、<code>v[8]</code>。优化器状态很贵 → ZeRO 要切开存。</p>
+  </div>
+
+  <table>
+    <thead><tr><th>符号</th><th>意思</th><th>切什么</th></tr></thead>
+    <tbody>
+      <tr><td><strong>P<sub>os</sub></strong></td><td>Partition Optimizer States</td><td>切优化器状态 m, v</td></tr>
+      <tr><td><strong>P<sub>g</sub></strong></td><td>Partition Gradients</td><td>切梯度</td></tr>
+      <tr><td><strong>P<sub>p</sub></strong></td><td>Partition Parameters</td><td>切参数本身</td></tr>
+    </tbody>
+  </table>
+  <p><strong>Stage 1</strong> = 只有 P<sub>os</sub> &nbsp;·&nbsp; <strong>Stage 2</strong> = P<sub>os</sub>+P<sub>g</sub> &nbsp;·&nbsp; <strong>Stage 3</strong> = P<sub>os</sub>+P<sub>g</sub>+P<sub>p</sub></p>
+
+  <h2 id="comms">1. 集合通信：运行时长什么样</h2>
+
+  <h3>1.1 All-reduce（SUM，再可选 ÷N）</h3>
+  <p class="muted">每人投入完整向量 → 每人拿回同一份聚合结果。</p>
+  <div class="grid gpus">
+    <div class="gpu"><div class="tag">卡0 开始</div><div class="vec">[0, 1, 2, 3]</div></div>
+    <div class="gpu"><div class="tag">卡1 开始</div><div class="vec">[4, 5, 6, 7]</div></div>
+    <div class="gpu"><div class="tag">卡2 开始</div><div class="vec">[8, 9, 10, 11]</div></div>
+    <div class="gpu"><div class="tag">卡3 开始</div><div class="vec">[12, 13, 14, 15]</div></div>
+  </div>
+  <div class="arrow">↓ all-reduce SUM</div>
+  <div class="grid after">
+    <div class="gpu" style="grid-column: 1 / -1;">
+      <div class="tag">每卡结束（和）</div>
+      <div class="vec">[24, 28, 32, 36]</div>
+      <p class="muted" style="margin:8px 0 0;">再 ÷4 → <code>[6, 7, 8, 9]</code>（平均）</p>
+    </div>
+  </div>
+
+  <h3>1.2 Broadcast（src=0）</h3>
+  <p class="muted">指定卡上的向量覆盖所有人。</p>
+  <div class="grid gpus">
+    <div class="gpu"><div class="tag">卡0 开始</div><div class="vec">[10, 10, 10, 10]</div></div>
+    <div class="gpu"><div class="tag">卡1 开始</div><div class="vec">[0, 0, 0, 0]</div></div>
+    <div class="gpu"><div class="tag">卡2 开始</div><div class="vec">[0, 0, 0, 0]</div></div>
+    <div class="gpu"><div class="tag">卡3 开始</div><div class="vec">[0, 0, 0, 0]</div></div>
+  </div>
+  <div class="arrow">↓ broadcast(src=0)</div>
+  <div class="grid after">
+    <div class="gpu" style="grid-column:1/-1"><div class="tag">每卡结束</div><div class="vec">[10, 10, 10, 10]</div></div>
+  </div>
+  <p class="note">作业 <code>ShardedOptimizer.step</code> 末尾对每个参数做的，就是这类：<code>broadcast(p.data, src=owner)</code>。</p>
+
+  <h3>1.3 Reduce-scatter（SUM）</h3>
+  <p class="muted">每人投入完整向量 → 每人只拿走「全局和」的一块。</p>
+  <div class="grid gpus">
+    <div class="gpu"><div class="tag">卡0 开始</div><div class="vec">[0, 1, 2, 3]</div></div>
+    <div class="gpu"><div class="tag">卡1 开始</div><div class="vec">[4, 5, 6, 7]</div></div>
+    <div class="gpu"><div class="tag">卡2 开始</div><div class="vec">[8, 9, 10, 11]</div></div>
+    <div class="gpu"><div class="tag">卡3 开始</div><div class="vec">[12, 13, 14, 15]</div></div>
+  </div>
+  <div class="arrow">↓ reduce-scatter → 位置和 = 24, 28, 32, 36</div>
+  <div class="grid gpus after">
+    <div class="gpu"><div class="tag">卡0 结束</div><div class="vec">持有 [24]<br/><span class="muted">只关心位置0</span></div></div>
+    <div class="gpu"><div class="tag">卡1 结束</div><div class="vec">持有 [28]<br/><span class="muted">只关心位置1</span></div></div>
+    <div class="gpu"><div class="tag">卡2 结束</div><div class="vec">持有 [32]</div></div>
+    <div class="gpu"><div class="tag">卡3 结束</div><div class="vec">持有 [36]</div></div>
+  </div>
+
+  <h3>1.4 All-gather</h3>
+  <p class="muted">每人投入一块 → 每人凑齐全部。</p>
+  <div class="grid gpus">
+    <div class="gpu"><div class="tag">卡0 开始</div><div class="vec">[24]</div></div>
+    <div class="gpu"><div class="tag">卡1 开始</div><div class="vec">[28]</div></div>
+    <div class="gpu"><div class="tag">卡2 开始</div><div class="vec">[32]</div></div>
+    <div class="gpu"><div class="tag">卡3 开始</div><div class="vec">[36]</div></div>
+  </div>
+  <div class="arrow">↓ all-gather</div>
+  <div class="grid after">
+    <div class="gpu" style="grid-column:1/-1"><div class="tag">每卡结束</div><div class="vec">[24, 28, 32, 36]</div></div>
+  </div>
+  <p class="muted">常见配对：完整多份 → <strong>reduce-scatter</strong> → 本地算 → <strong>all-gather</strong> → 每人完整结果。</p>
+
+  <h2 id="ddp">2. 朴素 DDP：每卡全套</h2>
+  <div class="grid">
+    <div class="panel">
+      <strong>每卡都有</strong>
+      <ul>
+        <li><code>W[8]</code> 完整参数</li>
+        <li><code>G[8]</code> 完整梯度</li>
+        <li><code>m[8], v[8]</code> 完整 Adam 状态</li>
+      </ul>
+    </div>
+    <div class="panel">
+      <strong>一步</strong>
+      <ol>
+        <li>本地 forward / backward → 本地 G</li>
+        <li>all-reduce 平均 G → 每卡 G 相同</li>
+        <li>用完整 (m,v) 更新完整 W</li>
+      </ol>
+    </div>
+  </div>
+
+  <h2 id="s1">3. ZeRO Stage 1 = P<sub>os</sub></h2>
+  <p>只切优化器状态。8 个权重切成 4 段，每段 2 个：</p>
+  <table>
+    <thead><tr><th>卡</th><th>负责的下标</th><th>只存这些下标的 m,v</th></tr></thead>
+    <tbody>
+      <tr><td>0</td><td>0,1</td><td>m0,m1 / v0,v1</td></tr>
+      <tr><td>1</td><td>2,3</td><td>m2,m3 / v2,v3</td></tr>
+      <tr><td>2</td><td>4,5</td><td>…</td></tr>
+      <tr><td>3</td><td>6,7</td><td>…</td></tr>
+    </tbody>
+  </table>
+
+  <h3>每卡存什么</h3>
+  <div class="grid gpus">
+    <div class="gpu">
+      <div class="tag">卡0</div>
+      <div class="vec">W: 完整 8<br/>G: 完整 8（或稍后只留分片）<br/>m,v: 仅下标 0,1</div>
+    </div>
+    <div class="gpu">
+      <div class="tag">卡1</div>
+      <div class="vec">W: 完整 8<br/>G: 完整 8<br/>m,v: 仅下标 2,3</div>
+    </div>
+    <div class="gpu">
+      <div class="tag">卡2</div>
+      <div class="vec">W / G 完整<br/>m,v: 仅 4,5</div>
+    </div>
+    <div class="gpu">
+      <div class="tag">卡3</div>
+      <div class="vec">W / G 完整<br/>m,v: 仅 6,7</div>
+    </div>
+  </div>
+
+  <h3>一步（一种常见调度）</h3>
+  <div class="panel">
+    <p><strong>A.</strong> 假设归约后梯度都是 <code>G = [1,1,1,1,1,1,1,1]</code></p>
+    <p><strong>B.</strong> 各卡只用自己的 m,v 更新自己分片：</p>
+    <div class="grid gpus">
+      <div class="gpu"><div class="tag">卡0</div><div class="vec">更新 → w0', w1'</div></div>
+      <div class="gpu"><div class="tag">卡1</div><div class="vec">更新 → w2', w3'</div></div>
+      <div class="gpu"><div class="tag">卡2</div><div class="vec">更新 → w4', w5'</div></div>
+      <div class="gpu"><div class="tag">卡3</div><div class="vec">更新 → w6', w7'</div></div>
+    </div>
+    <p class="muted">此时各卡完整 W 尚不一致（别人的维还是旧的）。</p>
+    <div class="arrow">↓ all-gather 参数分片</div>
+    <div class="gpu after" style="margin-top:8px">
+      <div class="tag">每卡结束</div>
+      <div class="vec">W = [w0', w1', w2', w3', w4', w5', w6', w7']</div>
+    </div>
+  </div>
+
+  <p class="note">
+    「只更新本分片权重 → 更新时只需要本分片梯度」——这句话对。<br/>
+    但请分清两件事：<strong>反传时</strong>整模仍会算出整条局部 G（每个参数位置都有数）；
+    <strong>step 之后</strong>可以只<strong>保留</strong>与本分片对应的那截（或 reduce-scatter 后本来就只拿到那截）。
+    不是「反传只算 1/4 参数的 grad」。丢掉的是「用不上的那截存着」，不是跳过反传。
+  </p>
+
+  <h2 id="s23">4. Stage 2 / 3（一眼）</h2>
+  <div class="grid">
+    <div class="panel">
+      <strong>Stage 2 = P<sub>os</sub>+P<sub>g</sub></strong>
+      <p>连梯度也按分片<strong>长期存放</strong>。卡0主要留 [g0,g1] + 对应 m,v。这比「step 时只用分片 grad」更进一步。</p>
+    </div>
+    <div class="panel">
+      <strong>Stage 3 = +P<sub>p</sub></strong>
+      <p>参数本身也只存分片；算之前 all-gather 拼出来，用完可丢掉。接近 FSDP。</p>
+    </div>
+  </div>
+
+  <h2 id="hw">5. 作业 ShardedOptimizer</h2>
+  <p>为了和下一节对照公平，这里也用<strong>连续分片</strong>（与第 3 节同一套）：卡0管 w0–w1，卡1管 w2–w3，…（实现里是 <code>i % world_size</code>，归属规则不同，但「对齐新 W」的通信逻辑一样。）</p>
+  <div class="panel">
+    <p><strong>step</strong></p>
+    <ol>
+      <li>本地 <code>AdamW.step()</code>：只改本分片</li>
+      <li>对齐新 W：对每个参数 <code>broadcast(p.data, src=owner)</code>（详见下一节 <strong>方案 A</strong>）</li>
+    </ol>
+  </div>
+
+  <h2 id="core-diff">6. 核心差异：对齐新 W —— A = 多次 broadcast，B = 一次 all-gather</h2>
+
+  <p>
+    省 OPT、每卡只更新约 1/4 权重：作业和典型 ZeRO-1 <strong>同一类</strong>。<br/>
+    真正不一样、也值得数清楚「几次通信」的，是<strong>更新之后如何让每人都拿到完整新 W</strong>。
+  </p>
+  <p class="note">
+    下面只盯这一步。假设本地 step <strong>已经做完</strong>：各卡只把自己分片改成带撇的新值，别人的维仍是旧值。
+  </p>
+
+  <h3>共同起点（4 卡，W 共 8 个数）</h3>
+  <table>
+    <thead><tr><th>卡</th><th>本地刚更新的分片</th><th>本卡完整 W 此刻长什么样（示意）</th></tr></thead>
+    <tbody>
+      <tr><td>0</td><td><code>w0', w1'</code></td><td><code>[w0', w1', w2, w3, w4, w5, w6, w7]</code>（后六维还是旧的）</td></tr>
+      <tr><td>1</td><td><code>w2', w3'</code></td><td><code>[w0, w1, w2', w3', w4, w5, w6, w7]</code></td></tr>
+      <tr><td>2</td><td><code>w4', w5'</code></td><td><code>[w0, w1, w2, w3, w4', w5', w6, w7]</code></td></tr>
+      <tr><td>3</td><td><code>w6', w7'</code></td><td><code>[w0, w1, w2, w3, w4, w5, w6', w7']</code></td></tr>
+    </tbody>
+  </table>
+  <p class="muted">目标结束态（A、B 都一样）：每卡 <code>W = [w0', w1', w2', w3', w4', w5', w6', w7']</code>。</p>
+
+  <h3>方案 A —— 作业：按 owner 多次 <code>broadcast</code></h3>
+  <p>
+    API 语义：每次 <code>broadcast(tensor, src=k)</code> = <strong>1 次</strong>集合通信调用：
+    全体参与，用卡 k 上的那份 <code>tensor</code> 覆盖所有人同名位置。
+  </p>
+
+  <div class="panel">
+    <p><strong>A1. 若 8 个独立参数（作业代码的真实写法：对每个 <code>Parameter</code> 调一次）</strong></p>
+    <ol>
+      <li><code>broadcast(w0, src=0)</code> → 四人的 w0 都变成 w0'</li>
+      <li><code>broadcast(w1, src=0)</code> → 四人的 w1 都变成 w1'</li>
+      <li><code>broadcast(w2, src=1)</code> → 四人的 w2 都变成 w2'</li>
+      <li><code>broadcast(w3, src=1)</code></li>
+      <li><code>broadcast(w4, src=2)</code></li>
+      <li><code>broadcast(w5, src=2)</code></li>
+      <li><code>broadcast(w6, src=3)</code></li>
+      <li><code>broadcast(w7, src=3)</code></li>
+    </ol>
+    <p><strong>集体通信次数 = 8 次 broadcast</strong>（参数个数次）。</p>
+  </div>
+
+  <div class="panel">
+    <p><strong>A2. 若先把每卡分片打成一块再发（教学对照用，作业没强制打包）</strong></p>
+    <ol>
+      <li><code>broadcast([w0',w1'], src=0)</code> → 四人下标 0,1 对齐</li>
+      <li><code>broadcast([w2',w3'], src=1)</code></li>
+      <li><code>broadcast([w4',w5'], src=2)</code></li>
+      <li><code>broadcast([w6',w7'], src=3)</code></li>
+    </ol>
+    <p><strong>集体通信次数 = 4 次 broadcast</strong>（= world_size，每个 owner 发自己那一块）。</p>
+  </div>
+
+  <div class="grid gpus after">
+    <div class="gpu"><div class="tag">A 结束后卡0</div><div class="vec">[w0'…w7']</div></div>
+    <div class="gpu"><div class="tag">卡1</div><div class="vec">同上完整新 W</div></div>
+    <div class="gpu"><div class="tag">卡2</div><div class="vec">同上</div></div>
+    <div class="gpu"><div class="tag">卡3</div><div class="vec">同上</div></div>
+  </div>
+
+  <h3>方案 B —— 典型 ZeRO-1：一次 <code>all-gather</code> 参数分片</h3>
+  <p>
+    API 语义：每人投入<strong>自己的一块</strong> → 一次集体通信后，每人手里拼出<strong>全部块按顺序排好</strong>。
+  </p>
+  <div class="grid gpus">
+    <div class="gpu"><div class="tag">卡0 投入</div><div class="vec">shard0 = [w0', w1']</div></div>
+    <div class="gpu"><div class="tag">卡1 投入</div><div class="vec">shard1 = [w2', w3']</div></div>
+    <div class="gpu"><div class="tag">卡2 投入</div><div class="vec">shard2 = [w4', w5']</div></div>
+    <div class="gpu"><div class="tag">卡3 投入</div><div class="vec">shard3 = [w6', w7']</div></div>
+  </div>
+  <div class="arrow">↓ <strong>1 次</strong> all-gather（拼 4 块）</div>
+  <div class="gpu after" style="margin-top:8px">
+    <div class="tag">每卡结束（同一次通信后）</div>
+    <div class="vec">W = concat(shard0…shard3) = [w0', w1', w2', w3', w4', w5', w6', w7']</div>
+  </div>
+  <p><strong>集体通信次数 = 1 次 all-gather</strong>。</p>
+
+  <h3>A 和 B 到底哪里不一样（数清楚）</h3>
+  <table class="compare">
+    <thead>
+      <tr><th></th><th>A 作业（broadcast）</th><th>B 典型 ZeRO-1（all-gather）</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>在干什么</td><td>「这块以谁为准？→ 用 owner 覆盖所有人」</td><td>「每人交出一块 → 每人拼齐全部块」</td>
+      </tr>
+      <tr>
+        <td>API 调用次数<br/>（玩具 8 维 / 4 卡）</td><td>未打包：<strong>8 次</strong> broadcast<br/>按分片打包：<strong>4 次</strong> broadcast</td>
+        <td><strong>1 次</strong> all-gather</td>
+      </tr>
+      <tr>
+        <td>谁提供数据</td><td>每次只有一个 src；别人那次只接收</td>
+        <td>每一次通信里，四卡都既发自己的分片、又收别人的分片</td>
+      </tr>
+      <tr>
+        <td>结束态</td><td>每人完整新 W</td><td>每人完整新 W（一样）</td>
+      </tr>
+      <tr>
+        <td>省不省 OPT</td><td>一样省（都只养本分片 m,v）</td><td>一样省</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="panel">
+    <p><strong>一句话</strong></p>
+    <p style="margin:0">
+      核心差异就是对齐新 W 这一步的集合通信形态：
+      <strong>A = 多次 broadcast（按参数或按 owner 块）</strong>；
+      <strong>B = 一次 all-gather（四块拼成完整 W）</strong>。
+      终点相同；次数与「谁在发」不同。
+    </p>
+  </div>
+
+  <p class="muted">
+    注：底层 NCCL 里一次 all-gather / 一次 broadcast 内部还可能拆成多段消息；
+    这里数的是<strong>你们在代码里发起的集体通信调用次数</strong>，这才是「日程」差异说得清的那一层。
+  </p>
+
+  <h2 id="cmp">7. 对照表</h2>
+  <table class="compare">
+    <thead>
+      <tr><th></th><th>朴素 DDP</th><th>ZeRO-1 P<sub>os</sub>（典型）</th><th>作业 ShardedOptimizer</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>W</td><td>完整</td><td>完整</td><td>完整</td></tr>
+      <tr><td>G</td><td>完整</td><td>完整，或 reduce-scatter 后只留分片</td><td>完整（step 只用本分片 grad）</td></tr>
+      <tr><td>m,v</td><td>完整</td><td><strong>仅分片</strong></td><td><strong>仅分片</strong></td></tr>
+      <tr><td>对齐新 W</td><td>常已各自一致</td><td><strong>B：1× all-gather</strong></td><td><strong>A：多次 broadcast</strong></td></tr>
+    </tbody>
+  </table>
+
+  <h3>时间线（只记这个也行）</h3>
+  <div class="panel">
+    <pre style="margin:0; white-space:pre-wrap; font-family:inherit; font-size:0.92rem;">朴素 DDP:
+  完整W, 完整G, 完整OPT → all-reduce G → 每人更新完整W
+
+ZeRO-1 (P_os) 典型:
+  完整W, (完整或分片)G, 分片OPT
+  → 每人更新自己的W分片
+  → 【B】1× all-gather W分片 → 完整W
+
+作业 ShardedOptimizer:
+  完整W, 完整G, 分片OPT
+  → 每人更新自己的W分片
+  → 【A】多次 broadcast(src=owner) → 完整W</pre>
+  </div>
+
+  <h2 id="bw">8. 流量 / 带宽到底怎么算？</h2>
+
+  <p class="note">
+    短答：<strong>不要用「集体通信调用了几次」当流量。</strong>
+    「8 次 / 4 次 broadcast」和「1 次 all-gather」说的是<strong>发起了几次算子</strong>（偏延迟 α）；
+    带宽要比的是<strong>搬了多少字节</strong>（偏体积 β）。
+    对「对齐新 W」这一步，A 和 B 要搬的<strong>有用数据量往往一样多</strong>；差在拆成几次发、消息多碎。
+  </p>
+
+  <h3>8.1 先扔掉一个误解</h3>
+  <table>
+    <thead><tr><th>错误想法</th><th>问题</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>4 次 broadcast = 4 份流量；1 次 all-gather = 1 份流量</td>
+        <td>把「调用次数」当成了「数据量」。一次很大的 all-gather 可以比四次很小的 broadcast 搬更多或一样多的字节。</td>
+      </tr>
+      <tr>
+        <td>all-gather 次数少，所以总带宽一定更省</td>
+        <td>次数少主要省的是<strong>启动开销 / 延迟</strong>；字节量要另算。对齐完整新 W 时，两边有用字节常常<strong>同阶甚至相同</strong>。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>8.2 这一步信息论下界：每人缺多少？</h3>
+  <p>仍用玩具：N=4 卡，完整 W 共 8 个数；每卡刚更新自己的 2 个数，缺另外 6 个新值。</p>
+  <div class="grid gpus">
+    <div class="gpu"><div class="tag">卡0 已有</div><div class="vec">w0', w1'</div><p class="muted">还需 6 个数</p></div>
+    <div class="gpu"><div class="tag">卡1 已有</div><div class="vec">w2', w3'</div><p class="muted">还需 6</p></div>
+    <div class="gpu"><div class="tag">卡2 已有</div><div class="vec">w4', w5'</div><p class="muted">还需 6</p></div>
+    <div class="gpu"><div class="tag">卡3 已有</div><div class="vec">w6', w7'</div><p class="muted">还需 6</p></div>
+  </div>
+  <div class="panel">
+    <p style="margin:0">
+      <strong>有用数据下界（只数「必须送到某卡的新分量」）：</strong><br/>
+      每卡接收 ≥ 6 个元素 → 四卡合计 ≥ <strong>24 个元素</strong>的「送达量」。<br/>
+      （设每个元素大小为 S 字节，则 ≥ <strong>24S</strong> 字节的有用载荷被接收。）
+    </p>
+  </div>
+  <p class="muted">A（多次 broadcast）和 B（一次 all-gather）都是为了填这 24 个空位；所以<strong>有用流量同阶，不是「1 对 4」</strong>。</p>
+
+  <h3>8.3 按「有用送达量」逐项加总（教学账本）</h3>
+  <p>约定：一次把大小为 M 的张量 broadcast 给 N 卡时，非 src 的 N−1 张卡各收到 M → 计入有用送达 <code>(N−1)·M</code>。all-gather 时，每卡收到别人的分片之和。</p>
+
+  <table>
+    <thead>
+      <tr><th>方案</th><th>怎么发</th><th>有用送达量（元素个数）</th><th>集体调用次数</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>A1</strong> 8× broadcast（每次 1 个数）</td>
+        <td>每次：3 张非 src 卡各收 1 → 每次送达 3；×8</td>
+        <td><strong>3×8 = 24</strong></td>
+        <td>8</td>
+      </tr>
+      <tr>
+        <td><strong>A2</strong> 4× broadcast（每次 1 个分片=2 个数）</td>
+        <td>每次：3 张卡各收 2 → 每次送达 6；×4</td>
+        <td><strong>6×4 = 24</strong></td>
+        <td>4</td>
+      </tr>
+      <tr>
+        <td><strong>B</strong> 1× all-gather（4 块×2）</td>
+        <td>每卡收到另外 3 块×2 = 6；×4 卡</td>
+        <td><strong>6×4 = 24</strong></td>
+        <td>1</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="panel">
+    <p><strong>结论（对「对齐新 W」）</strong></p>
+    <ul style="margin:8px 0 0;">
+      <li>有用字节：A1 = A2 = B = <strong>24S</strong>（同一下界，打满）。</li>
+      <li>不是「all-gather 只算一份流量、broadcast 算四份」。</li>
+      <li>差别主要在：<strong>拆成几次集体通信</strong>（8 / 4 / 1），以及每次消息多碎。</li>
+    </ul>
+  </div>
+
+  <h3>8.4 时间怎么估：α–β 模型（把「次数」和「字节」拆开）</h3>
+  <p>集合通信耗时常粗写成：</p>
+  <div class="panel">
+    <pre style="margin:0; font-family:inherit;">T ≈ α · (#集体调用或关键消息段)
+  + β · (每卡沿关键路径搬动的字节数)</pre>
+  </div>
+  <ul>
+    <li><strong>α</strong>：启动一次通信的固定开销（延迟）。调用越多，α 项越大 → 所以 8× 小 broadcast 往往比 1× all-gather <strong>更亏在延迟</strong>。</li>
+    <li><strong>β</strong>：每字节传输成本。有用字节相同时，β 项<strong>同阶</strong>；实现上 ring/tree 可能多一点点转发冗余，但数量级仍由「每人要补齐 6 个数」决定。</li>
+  </ul>
+  <p>因此更准确的说法是：</p>
+  <table>
+    <thead><tr><th></th><th>有用带宽（字节）</th><th>延迟敏感（调用次数）</th></tr></thead>
+    <tbody>
+      <tr><td>A1 8× broadcast</td><td>≈ 24S</td><td>最差（8 次启动）</td></tr>
+      <tr><td>A2 4× broadcast</td><td>≈ 24S</td><td>中等（4 次）</td></tr>
+      <tr><td>B 1× all-gather</td><td>≈ 24S</td><td>最好（1 次）</td></tr>
+    </tbody>
+  </table>
+  <p class="muted">作业用多次 broadcast 是为了实现简单、和「每个 Parameter 有一个 owner」对齐；生产 ZeRO 更爱打包 + all-gather，主要吃的是 <strong>少 α</strong>，不是「少搬了 3/4 的权重字节」。</p>
+
+  <h3>8.5 若问「每卡发出/收到多少」——ring all-gather 直觉</h3>
+  <p>以常见 <strong>ring all-gather</strong> 为例（N=4，每卡分片大小 M<sub>shard</sub>=2S）：</p>
+  <ul>
+    <li>算法上大约走 N−1 = 3 步；每步每卡发出一块分片、收入一块分片。</li>
+    <li>故<strong>每卡发送 ≈ 3·2S = 6S</strong>，<strong>每卡接收 ≈ 6S</strong>（正好补齐缺的 6 个元素）。</li>
+  </ul>
+  <p>对 <strong>A2</strong>（每个 owner 做一次大小 2S 的 broadcast）：理想树上每卡作为非 owner 时会收到 3 个别人的分片 → 接收仍是 <strong>6S</strong>。和 all-gather 的「每卡接收有用字节」对齐。</p>
+  <p class="note">
+    底层 NCCL 具体拓扑（ring / tree）可能让「线上总跳数」略多于有用下界，但比较 A vs B 时，
+    <strong>先比有用字节（这里都是 24S），再比调用次数（α）</strong>，就不会再把「1 次集体」误当成「1 份流量」。
+  </p>
+
+  <h3>8.6 收束</h3>
+  <div class="panel">
+    <ol style="margin:0; padding-left:1.2em;">
+      <li><strong>流量按字节算</strong>，不按「调用了几次算子」算。</li>
+      <li>对齐新 W：A 与 B 的有用流量都是「每卡补齐别人的分片」→ 玩具里都是 <strong>24S</strong>。</li>
+      <li>all-gather「次数更少」赢在 <strong>α（延迟）</strong>；不是自动赢在「总带宽少 3/4」。</li>
+      <li>8× 比 4× 更碎：字节仍约 24S，但 α 更大，小消息更不划算。</li>
+    </ol>
+  </div>
+
+  <p class="muted" style="margin-top:28px;">对应 Markdown：<code>misc/misc-zero-explained.md</code></p>
+</div>
+</body>
+</html>

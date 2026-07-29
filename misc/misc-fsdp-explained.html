@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>FSDP 第一性原理（调用关系 · Hook · Handle）</title>
+<style>
+  :root {
+    --bg: #f4f1ea;
+    --ink: #1a1916;
+    --muted: #5a554c;
+    --line: #d4cdc0;
+    --card: #fffcf6;
+    --accent: #1a4f6e;
+    --accent2: #8a3b1f;
+    --chip: #e5dfd2;
+    --ok: #d9ebe3;
+    --warn: #f2e5d6;
+    --code: #f0ebe3;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "IBM Plex Sans", "Noto Sans SC", "Segoe UI", sans-serif;
+    color: var(--ink);
+    background:
+      radial-gradient(800px 380px at 0% -5%, #dde8ef 0%, transparent 55%),
+      radial-gradient(700px 360px at 100% 0%, #efe4d6 0%, transparent 50%),
+      var(--bg);
+    line-height: 1.55;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 40px 20px 90px; }
+  h1 {
+    font-family: "Iowan Old Style", "Source Han Serif SC", Georgia, serif;
+    font-weight: 600; font-size: 1.85rem; letter-spacing: -0.02em; margin: 0 0 8px;
+  }
+  .lede { color: var(--muted); font-size: 1.02rem; max-width: 46em; margin-bottom: 24px; }
+  h2 {
+    font-family: "Iowan Old Style", "Source Han Serif SC", Georgia, serif;
+    font-size: 1.4rem; margin: 40px 0 12px; padding-top: 10px; border-top: 1px solid var(--line);
+  }
+  h3 { font-size: 1.05rem; margin: 22px 0 10px; color: var(--accent); }
+  p, li { max-width: 48em; }
+  .note {
+    background: var(--warn); border-left: 4px solid var(--accent2);
+    padding: 10px 14px; margin: 14px 0 18px; font-size: 0.95rem;
+  }
+  .why {
+    background: var(--ok); border-left: 4px solid var(--accent);
+    padding: 10px 14px; margin: 12px 0 16px; font-size: 0.95rem;
+  }
+  table {
+    width: 100%; border-collapse: collapse; background: var(--card);
+    margin: 12px 0 18px; font-size: 0.9rem;
+  }
+  th, td { border: 1px solid var(--line); padding: 8px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--chip); }
+  .panel {
+    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+    padding: 14px 16px; margin: 12px 0 18px;
+  }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 12px 0; }
+  @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
+  .pill {
+    display: inline-block; background: var(--chip); padding: 2px 8px; border-radius: 6px;
+    font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: 0.84rem;
+  }
+  pre.ascii, pre.code {
+    background: var(--code); border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px 16px; overflow-x: auto; font-size: 0.78rem; line-height: 1.35;
+    font-family: "IBM Plex Mono", "SF Mono", ui-monospace, monospace;
+  }
+  nav.toc {
+    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+    padding: 14px 18px; margin-bottom: 26px;
+  }
+  nav.toc a { color: var(--accent); text-decoration: none; margin-right: 12px; font-size: 0.9rem; }
+  nav.toc a:hover { text-decoration: underline; }
+  .muted { color: var(--muted); font-size: 0.92rem; }
+  .call { font-weight: 600; color: var(--accent); }
+  ol. Tight > li { margin-bottom: 6px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>FSDP：从第一性原理到接口调用图</h1>
+  <p class="lede">
+    对应讲义 §7 / PDF ~p.38–39。目标不是先写满实现，而是先搞清：
+    <strong>为什么要有 Hook / Handle</strong>，以及训练一步里<strong>谁调用谁</strong>（细化到公开接口与钩子类型）。
+  </p>
+
+  <nav class="toc">
+    <a href="#why">Why</a>
+    <a href="#vs">和 OPT 分片差在哪</a>
+    <a href="#hook-handle">Hook vs Handle</a>
+    <a href="#ascii">ASCII 总图</a>
+    <a href="#api">公开接口</a>
+    <a href="#lifecycle">一步生命周期</a>
+    <a href="#hooks-detail">钩子时刻表</a>
+    <a href="#prefetch">预取规则</a>
+    <a href="#impl">实现要点</a>
+    <a href="#adapters">Adapters / 测试</a>
+  </nav>
+
+  <!-- ========== 1 WHY ========== -->
+  <h2 id="why">1. 第一性原理：缺什么，所以要通信</h2>
+  <p>一张卡要算一层线性层：<code>y = x @ W</code>。算式本身要求<strong>完整的 W</strong>（或等价的完整视图）。</p>
+  <div class="why">
+    <strong>Why shard parameters at all？</strong><br/>
+    DDP / 作业里的 ShardedOptimizer：每卡仍常驻<strong>完整 W</strong>，只切 OPT（和可选切 G）。
+    FSDP 再进一步：平时每卡只存 <code>W</code> 的 <strong>1/N 分片</strong>。于是「要算 matmul」和「平时只存分片」矛盾 →
+    算之前必须 <strong>all-gather</strong> 临时拼出完整 W；算完立刻丢掉完整视图，只留分片。
+  </div>
+  <div class="why">
+    <strong>Why reduce-scatter gradients？</strong><br/>
+    每卡本地 batch 不同 → 算出的完整 <code>dW</code> 是局部的。
+    更新时每卡只负责自己那一截参数（和分片形状对齐）→ 不需要每人留完整平均 G，
+    用 <strong>reduce-scatter</strong>：归约 + 按分片分发，每卡只留下自己那截梯度。
+  </div>
+  <div class="why">
+    <strong>Why hooks？</strong><br/>
+    你不会在 <code>model.forward</code> 里手写「第 3 层前 gather、第 3 层后 free」。
+    层是嵌套调用的；autograd 反传顺序也由图决定。
+    <strong>Hook = 挂在「层即将算 / 刚算完 / grad 刚写好」上的回调</strong>，让通信自动插入正确时刻。
+  </div>
+  <div class="why">
+    <strong>Why handles（Work）？</strong><br/>
+    <code>async_op=True</code> 时集合通信立刻返回一个 <span class="pill">dist.Work</span>，GPU/后台继续传，
+    CPU 可以先去干别的（算别的层）。
+    <strong>Handle = 这张「未完成通信」的收据</strong>；必须在<strong>用到结果之前</strong> <code>wait()</code>，
+    否则读到的还是半成品。
+  </div>
+
+  <p class="note">
+    你的大图是对的：Forward 按层 all-gather P → 算 → 丢；Backward 倒序 all-gather P → 算 G → reduce-scatter → 丢完整 P。
+    补一句：小层（讲义里主要是 <strong>norm</strong>）<strong>不切</strong>，整份复制，省去无意义的通信延迟。
+  </p>
+
+  <!-- ========== 2 VS ========== -->
+  <h2 id="vs">2. 和「只切 OPT」差在哪（同轴加深）</h2>
+  <table>
+    <thead>
+      <tr><th></th><th>ShardedOptimizer（作业）</th><th>FSDP（本题）</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>平时存的 W</td><td>完整</td><td><strong>分片</strong>（Linear/Embedding）</td></tr>
+      <tr><td>平时存的 G</td><td>完整（step 只用分片）</td><td><strong>分片</strong>（reduce-scatter 后）</td></tr>
+      <tr><td>OPT</td><td>分片</td><td>自然跟参数分片走（AdamW 只看到分片 param）</td></tr>
+      <tr><td>前向要通信吗</td><td>通常不用为了 W</td><td><strong>每层（被切的）all-gather W</strong></td></tr>
+      <tr><td>后向要通信吗</td><td>DDP 侧常 all-reduce G</td><td>再 all-gather W + <strong>reduce-scatter G</strong></td></tr>
+      <tr><td>对齐新 W</td><td>broadcast / all-gather 整模</td><td>不必每人再拼完整常驻 W；常驻仍是分片</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ========== 3 HOOK HANDLE ========== -->
+  <h2 id="hook-handle">3. Hook 和 Handle：代码层面各是什么</h2>
+
+  <h3>3.1 Hook（钩子）——「事件回调」</h3>
+  <p><strong>登记</strong>发生在 <code>FSDP.__init__</code>；<strong>执行</strong>发生在之后的 forward/backward 途中，由 PyTorch 调用你。</p>
+  <table>
+    <thead><tr><th>钩子 API</th><th>何时被调</th><th>FSDP 典型用途</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>mod.register_forward_pre_hook(fn)</code></td>
+        <td>进入该层 <code>forward</code> <strong>之前</strong></td>
+        <td><code>wait</code> 本层权重 all-gather；确保 <code>weight.data</code> 已是完整视图</td>
+      </tr>
+      <tr>
+        <td><code>mod.register_forward_hook(fn)</code></td>
+        <td>该层 <code>forward</code> <strong>之后</strong></td>
+        <td>丢掉完整 W，写回分片；按预取规则启动更深层的 all-gather</td>
+      </tr>
+      <tr>
+        <td><code>mod.register_full_backward_pre_hook(fn)</code></td>
+        <td>该层 backward <strong>之前</strong></td>
+        <td>再次 all-gather（或 wait 预取）完整 W，供算 <code>dX</code>/<code>dW</code></td>
+      </tr>
+      <tr>
+        <td><code>param.register_post_accumulate_grad_hook(fn)</code></td>
+        <td>该参数 <code>.grad</code> 刚累加完</td>
+        <td>对完整（或临时）grad 做 <strong>async reduce-scatter</strong>；把 handle 存起来</td>
+      </tr>
+    </tbody>
+  </table>
+  <pre class="code"># 登记长什么样（概念）
+layer.register_forward_pre_hook(self._fwd_pre)          # fn(module, inputs)
+layer.register_forward_hook(self._fwd_post)             # fn(module, inputs, output)
+layer.register_full_backward_pre_hook(self._bwd_pre)    # fn(module, grad_output)
+weight.register_post_accumulate_grad_hook(self._grad_hook)  # fn(param)
+
+# 执行时不是你调的：是
+#   loss = model(x)           → 一路触发 forward_* hooks
+#   loss.backward()           → 倒序触发 backward / grad hooks</pre>
+
+  <h3>3.2 Handle（Work）——「异步通信收据」</h3>
+  <pre class="code"># 发起（不阻塞到传完）
+handle: dist.Work = dist.all_gather(..., async_op=True)
+# 或
+handle = dist.reduce_scatter_tensor(..., async_op=True)
+
+self._handles.append(handle)   # 先记在本子上，继续算别的
+
+# 必须在「读结果」之前
+handle.wait()                  # 阻塞到这次通信完成
+# 现在 buffer / param.grad 分片才安全可读</pre>
+  <div class="panel">
+    <p style="margin:0"><strong>和 OverlapDDP 的关系</strong></p>
+    <p class="muted" style="margin:8px 0 0">
+      你已写过的 <code>OverlapDDP</code>：grad hook 里 <code>all_reduce(..., async_op=True)</code> → 存 handle →
+      <code>finish_gradient_synchronization</code> 里 <code>wait</code>。
+      FSDP 同一套路，只是通信换成 <strong>all-gather(W)</strong> / <strong>reduce-scatter(G)</strong>，
+      并且 forward 路径上也要 wait/prefetch。
+    </p>
+  </div>
+
+  <!-- ========== 4 ASCII ========== -->
+  <h2 id="ascii">4. ASCII：谁调用谁（总图）</h2>
+  <pre class="ascii">┌─────────────────────────────────────────────────────────────────┐
+│ 测试 / 训练脚本                                                  │
+│                                                                 │
+│  fsdp = get_fsdp(model, compute_dtype=...)                      │
+│       └─► FSDP.__init__                                         │
+│             ├─ self.module = model                              │
+│             ├─ 遍历 Linear/Embedding → 切 weight 为本地 shard   │
+│             ├─ 登记 forward_pre / forward_post / bwd_pre hooks  │
+│             └─ 登记 weight.post_accumulate_grad_hook            │
+│                                                                 │
+│  opt = SGD(fsdp.parameters(), ...)   # 看到的是「分片参数」       │
+│                                                                 │
+│  out = fsdp(x)                                                  │
+│       └─► FSDP.forward → module.forward                         │
+│             └─► embedding → norm → linear1 → …                  │
+│                   每层被切模块：                                  │
+│                   forward_pre  → wait(本层 AG) / 装上完整 W      │
+│                   真正 matmul/embedding                         │
+│                   forward_post → free 完整 W；prefetch 更深层 AG │
+│                                                                 │
+│  loss.backward()                                                │
+│       └─► autograd 倒序                                         │
+│             bwd_pre     → wait/AG 完整 W                        │
+│             算 dX, dW                                           │
+│             grad_hook   → async reduce-scatter → 存 Handle      │
+│             （完整 W 可再 free）                                  │
+│                                                                 │
+│  fsdp_on_after_backward(fsdp, opt)                              │
+│       └─► FSDP.finish_gradient_synchronization()                │
+│             └─► for h in handles: h.wait()                      │
+│                                                                 │
+│  opt.step()          # 只更新本地 shard + 对应 OPT 状态           │
+│                                                                 │
+│  full = fsdp_gather_full_params(fsdp)  # 测试用：再 AG 出完整 W  │
+└─────────────────────────────────────────────────────────────────┘</pre>
+
+  <!-- ========== 5 API ========== -->
+  <h2 id="api">5. 公开接口（讲义 + adapters）</h2>
+  <table>
+    <thead><tr><th>接口</th><th>谁实现</th><th>职责</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>FSDP.__init__(module, compute_dtype=None)</code></td>
+        <td>你的类</td>
+        <td>包装模型；分片；挂钩；可选混合精度策略</td>
+      </tr>
+      <tr>
+        <td><code>FSDP.forward(*args, **kwargs)</code></td>
+        <td>你的类</td>
+        <td>转发给 <code>self.module</code>；通信靠 hooks，不塞在这里手写每层</td>
+      </tr>
+      <tr>
+        <td><code>FSDP.finish_gradient_synchronization()</code></td>
+        <td>你的类</td>
+        <td><code>wait</code> 所有未完成的 reduce-scatter（及必要的遗留通信）</td>
+      </tr>
+      <tr>
+        <td><code>get_fsdp(...)</code></td>
+        <td>adapter</td>
+        <td><code>return FSDP(...)</code></td>
+      </tr>
+      <tr>
+        <td><code>fsdp_on_after_backward(fsdp, opt)</code></td>
+        <td>adapter</td>
+        <td>通常只调 <code>fsdp.finish_gradient_synchronization()</code></td>
+      </tr>
+      <tr>
+        <td><code>fsdp_gather_full_params(fsdp)</code></td>
+        <td>adapter / 类方法</td>
+        <td>测试比对：把分片 all-gather 成完整 tensor 字典；norm 原样返回</td>
+      </tr>
+    </tbody>
+  </table>
+  <p class="muted">测试假定包装器上有 <span class="pill">fsdp_model.module</span>（与 DDP 习惯一致）。</p>
+
+  <!-- ========== 6 LIFECYCLE ========== -->
+  <h2 id="lifecycle">6. 一步训练：时间线（4 卡直觉）</h2>
+  <pre class="ascii">时间 →
+
+  [构造] 每卡 Linear.weight 只留 shard（约 1/4）
+         RMSNorm.weight 完整复制（不进 FSDP 切分）
+
+  [Forward 层 i]
+     ① 若预取已发出：forward_pre 里 handle.wait()
+     ② weight 临时变成完整（可先 cast → compute_dtype 再 AG，省带宽）
+     ③ 计算 y = f(x, W_full)
+     ④ forward_post：删掉 W_full，写回 shard；按规则 prefetch 层 i+2 的 AG
+
+  [Backward 层 i （倒序）]
+     ⑤ bwd_pre：再次具备 W_full（wait 或同步 AG）
+     ⑥ autograd 算出完整形状的局部 dW（相对本卡 batch）
+     ⑦ post_accumulate_grad_hook：
+          async reduce-scatter → 每卡 .grad 变成「自己那截」
+          handle 进列表；可 free W_full
+     ⑧ 激活梯度继续往更浅层流
+
+  [after backward]
+     ⑨ finish_gradient_synchronization：全部 handle.wait()
+     ⑩ optimizer.step()：Adam/SGD 只碰本地 shard</pre>
+
+  <div class="note">
+    「算完就丢」丢的是<strong>临时完整视图</strong>，不是把本地 shard 删掉。
+    Master 分片始终在；完整 W 是租来的缓冲区。
+  </div>
+
+  <!-- ========== 7 HOOK DETAIL ========== -->
+  <h2 id="hooks-detail">7. 钩子时刻表（单层被切模块）</h2>
+  <div class="grid">
+    <div class="panel">
+      <strong>Forward</strong>
+      <ol>
+        <li class="call">forward_pre</li>
+        <li>保证完整 W 就绪（wait handle）</li>
+        <li>层自身 forward 计算</li>
+        <li class="call">forward_post</li>
+        <li>free 完整 W；kick 更深层 prefetch</li>
+      </ol>
+    </div>
+    <div class="panel">
+      <strong>Backward</strong>
+      <ol>
+        <li class="call">full_backward_pre</li>
+        <li>完整 W 就绪</li>
+        <li>autograd 算 dW / dX</li>
+        <li class="call">post_accumulate_grad</li>
+        <li>async reduce-scatter；存 Handle；free W</li>
+      </ol>
+    </div>
+  </div>
+
+  <h3>混合精度（compute_dtype 非 None）</h3>
+  <p>讲义：通信前就 cast 到低精度 → 少传字节；master 与 OPT 仍 FP32。</p>
+  <ul>
+    <li>AG 前：<code>shard.to(compute_dtype)</code>（或在 buffer 上）再 all-gather</li>
+    <li>计算用低精度完整 W</li>
+    <li>reduce-scatter 后的 grad 再回到 FP32，与 master shard 对齐（测试要求 grad dtype == param.dtype）</li>
+  </ul>
+  <p class="muted">测试里非并行基线用同一套 cast hook（<code>_apply_mixed_precision_hooks</code>）对齐数值行为。</p>
+
+  <!-- ========== 8 PREFETCH ========== -->
+  <h2 id="prefetch">8. 预取规则（讲义硬约束）</h2>
+  <div class="panel">
+    <p>
+      <strong>原文要点：</strong>只有当「当前层前面两层」的 forward 已经完成时，才开始 gather 当前层权重。
+      也就是：在层 <code>i</code> 的 forward <em>之后</em>，去预取层 <code>i+2</code>（而不是立刻把后面所有层都 gather 满显存）。
+    </p>
+    <pre class="ascii">层序（被切的）:  L0  L1  L2  L3  L4 ...
+
+L0 forward_post ──prefetch──► 开始 AG(L2)
+L1 forward_post ──prefetch──► 开始 AG(L3)
+L2 forward_pre  ──wait─────► AG(L2) 必须已完成
+...
+
+Why：通信与计算重叠，又限制「同时存在的完整 W」数量（大约维持一小窗口，而不是整网完整副本）。</pre>
+  </div>
+
+  <!-- ========== 9 IMPL ========== -->
+  <h2 id="impl">9. 写代码前：函数职责清单（内部要点，不写满）</h2>
+  <table>
+    <thead><tr><th>建议内部方法</th><th>要点</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>_shard_parameters()</code></td>
+        <td>对 Linear/Embedding 的 weight：按 dim 切成 N 份，本 rank 只保留一块；记录 shard_size / 全 shape，供 AG/RS</td>
+      </tr>
+      <tr>
+        <td><code>_register_hooks()</code></td>
+        <td>只对要切的模块挂 4 类钩子；norm 跳过</td>
+      </tr>
+      <tr>
+        <td><code>_all_gather_weight(mod, async_=True) → Work|None</code></td>
+        <td>从各卡 shard 拼到临时 full buffer；可选先 cast；返回 handle</td>
+      </tr>
+      <tr>
+        <td><code>_wait_and_install(mod)</code></td>
+        <td>wait 该层 handle；把 <code>mod.weight.data</code> 指到完整视图（或 copy）</td>
+      </tr>
+      <tr>
+        <td><code>_free_full_weight(mod)</code></td>
+        <td>恢复为本地 shard 视图；释放 full buffer</td>
+      </tr>
+      <tr>
+        <td><code>_prefetch(mod_index)</code></td>
+        <td>对 index+2（若存在）发 async AG，存 handle</td>
+      </tr>
+      <tr>
+        <td><code>_reduce_scatter_grad(param) → Work</code></td>
+        <td>async RS；结果写入与 shard 同 shape 的 <code>param.grad</code></td>
+      </tr>
+      <tr>
+        <td><code>finish_gradient_synchronization</code></td>
+        <td>drain handles；必要时做平均（若 RS 用 SUM）</td>
+      </tr>
+      <tr>
+        <td><code>gather_full_params()</code></td>
+        <td>同步 AG 所有分片参数 → <code>dict[name, Tensor]</code>；复制参数直接 <code>.data.clone()</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="note">
+    两种常见结构任选其一（讲义允许）：
+    <strong>(1) hooks 挂在原 Linear/Embedding 上</strong>；
+    <strong>(2) 换成包装模块</strong>（包装器自己的 forward 里 gather→compute→free）。
+    测试只关心行为与 <code>.module</code> / adapters，不规定必须哪种。
+  </div>
+
+  <!-- ========== 10 ADAPTERS ========== -->
+  <h2 id="adapters">10. 测试怎么驱动你（所以接口必须对齐）</h2>
+  <pre class="code"># tests/test_fsdp.py 核心循环
+fsdp_model = get_fsdp(model, compute_dtype=...)
+opt = SGD(fsdp_model.parameters(), lr=0.01)
+
+out = fsdp_model(local_input)     # → FSDP.forward → hooks 干活
+loss.backward()                   # → bwd hooks + async RS
+fsdp_on_after_backward(fsdp_model, opt)  # → finish_gradient_synchronization
+opt.step()
+
+full = fsdp_gather_full_params(fsdp_model)
+# 与非并行模型参数 allclose</pre>
+
+  <div class="panel">
+    <p><strong>写代码顺序建议</strong></p>
+    <ol>
+      <li>骨架：<code>FSDP(nn.Module)</code> + <code>self.module</code> + <code>forward</code> 转发</li>
+      <li>分片 + 同步 all-gather/reduce-scatter（先不做 async / prefetch）— 先过正确性</li>
+      <li>换成 async + handles + <code>finish_gradient_synchronization</code></li>
+      <li>加 prefetch（layer-2 规则）</li>
+      <li>加 <code>compute_dtype</code></li>
+      <li>接上三个 adapters</li>
+    </ol>
+  </div>
+
+  <p class="muted" style="margin-top:28px;">
+    相关：<code>misc/misc-zero-explained.html</code>（P<sub>os</sub>/通信字节）·
+    <code>cs336_systems/distributed/overlap_ddp.py</code>（Handle + grad hook 范例）·
+    讲义 Problem (fsdp) PDF p.38–39。
+  </p>
+</div>
+</body>
+</html>

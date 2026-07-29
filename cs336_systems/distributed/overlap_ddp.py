@@ -20,7 +20,7 @@ class OverlapDDP(nn.Module):
         self._handles: list[dist.Work] = []
 
         self._broadcast_parameters()
-        self._register_grad_hooks()
+        self._register_grad_hooks() #构造的时候调用
 
     def _broadcast_parameters(self) -> None:
         if not dist.is_initialized():
