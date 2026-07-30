@@ -1,17 +1,16 @@
 """
-Timeline comparison: NaiveDDP (serial) vs OverlapDDP (overlapped).
+Overlap timeline: clean Gantt + kernel-density comparison.
 
-Reads nsys SQLite exports, draws two time-aligned Gantt rows:
-  - Compute kernels (green)
-  - Communication/NCCL kernels (red)
+Upper panel — schematic Gantt from benchmark timings (NaiveDDP vs OverlapDDP).
+Lower panel — kernel activity density from nsys SQLite (histogram, 5ms bins).
 
 Output: reports/figures/overlap_timeline.png
 """
 
 from __future__ import annotations
 
-import re
 import sqlite3
+from collections import defaultdict
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -20,16 +19,15 @@ import numpy as np
 # ---------------------------------------------------------------------------
 # Palette
 # ---------------------------------------------------------------------------
-BLUE   = "#2a78d6"
-ORANGE = "#eb6834"
-GREEN  = "#1baf7a"
-RED    = "#e34948"
+BLUE    = "#2a78d6"
+ORANGE  = "#eb6834"
+GREEN   = "#1baf7a"
+RED     = "#e34948"
 SURFACE = "#fcfcfb"
 GRIDLINE = "#e1e0d9"
 MUTED    = "#898781"
 INK      = "#0b0b0b"
 
-# Colours for compute vs communication
 COMPUTE_COLOR = GREEN
 COMM_COLOR    = RED
 
@@ -37,17 +35,55 @@ NAIVE_SQLITE   = Path("artifacts/nsys_naive.sqlite")
 OVERLAP_SQLITE = Path("artifacts/nsys_overlap.sqlite")
 OUT_PATH       = Path("reports/figures/overlap_timeline.png")
 
-STEP_DURATION_S = 2.0  # how many seconds of trace to show (around 1 step)
+# Benchmark timing numbers (seconds) — from benchmark_overlap_ddp.py
+NAIVE_BWD  = 0.295
+NAIVE_SYNC = 0.398
+OVERLAP_BWD  = 0.531
+OVERLAP_SYNC = 0.020
+
+BIN_MS = 5  # 5 ms bins for kernel density
 
 
-def _reldiff(a: int, b: int) -> float:
-    return abs(a - b) / max(abs(a), abs(b))
+# ---------------------------------------------------------------------------
+# Kernel density from nsys SQLite
+# ---------------------------------------------------------------------------
+def kernel_density(sqlite_path: Path, t0_ns: int, t1_ns: int
+                   ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return (bin_centers_s, compute_density, comm_density) for one step."""
+    db = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
+    rows = db.execute("""
+        SELECT start, end, demangledName
+        FROM CUPTI_ACTIVITY_KIND_KERNEL
+        WHERE demangledName IS NOT NULL
+          AND start >= ? AND end <= ?
+        ORDER BY start
+    """, (t0_ns, t1_ns)).fetchall()
+    db.close()
+
+    duration_s = (t1_ns - t0_ns) / 1e9
+    n_bins = max(1, int(duration_s / (BIN_MS / 1000)))
+    compute_hist = np.zeros(n_bins)
+    comm_hist    = np.zeros(n_bins)
+
+    for start_ns, end_ns, name in rows:
+        t0 = (start_ns - t0_ns) / 1e9
+        t1 = (end_ns   - t0_ns) / 1e9
+        bin_start = int(t0 / (BIN_MS / 1000))
+        bin_end   = int(t1 / (BIN_MS / 1000))
+        for b in range(max(0, bin_start), min(n_bins, bin_end + 1)):
+            if "nccl" in str(name).lower():
+                comm_hist[b] += 1
+            else:
+                compute_hist[b] += 1
+
+    centers = (np.arange(n_bins) + 0.5) * (BIN_MS / 1000)
+    return centers, compute_hist, comm_hist
 
 
-def load_kernels(sqlite_path: Path) -> list[tuple[float, float, str]]:
-    """Return [(start_s, end_s, kind)] where kind is 'compute' or 'comm'.
+def _find_step_window(sqlite_path: Path) -> tuple[int, int]:
+    """Find time window around the second measurement step (after warmup).
 
-    Times are relative to the first kernel in the trace (seconds).
+    Returns (start_ns, end_ns) for one representative step.
     """
     db = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
     rows = db.execute("""
@@ -59,86 +95,142 @@ def load_kernels(sqlite_path: Path) -> list[tuple[float, float, str]]:
     db.close()
 
     if not rows:
-        return []
+        return 0, 1
 
-    t0 = min(r[0] for r in rows)
-    kernels = []
-    for start_ns, end_ns, name in rows:
-        t_start = (start_ns - t0) / 1e9
-        t_end   = (end_ns   - t0) / 1e9
-        kind = "comm" if ("nccl" in str(name).lower()) else "compute"
-        kernels.append((t_start, t_end, kind))
-    return kernels
+    all_start  = min(r[0] for r in rows)
+    all_end    = max(r[1] for r in rows)
+    total_s    = (all_end - all_start) / 1e9
+
+    # Take the middle 1.5 seconds (one step ≈ 1.1s for Naive, 1.0s for Overlap)
+    mid = (all_start + all_end) // 2
+    half_window = int(0.9e9)  # ±0.9s
+    return mid - half_window, mid + half_window
 
 
-def plot_timeline(ax: plt.Axes, kernels: list[tuple[float, float, str]],
-                  title: str, t_max: float):
-    """Draw a Gantt-like timeline on ax."""
-    ax.set_facecolor(SURFACE)
-    ax.set_title(title, color=INK, fontsize=12, fontweight="bold")
+# ---------------------------------------------------------------------------
+# Main plot
+# ---------------------------------------------------------------------------
+def plot_gantt(ax, y, label, bwd_s, sync_s, comm_start_s, comm_end_s):
+    """Draw a single Gantt row: compute bar + communication bar."""
+    bar_h = 0.42
 
-    # Draw each kernel as a thin horizontal span
-    for t_start, t_end, kind in kernels:
-        if t_start > t_max:
-            break
-        if t_end - t_start < 1e-6:  # skip < 1μs kernels (too thin)
-            continue
-        color = COMM_COLOR if kind == "comm" else COMPUTE_COLOR
-        ax.axvspan(t_start, min(t_end, t_max), alpha=0.55, color=color,
-                   linewidth=0, zorder=2 if kind == "comm" else 1)
+    # Compute (backward)
+    ax.barh(y, bwd_s, bar_h, left=0, color=COMPUTE_COLOR, alpha=0.85,
+            zorder=3, label="Compute (backward)" if y == 1 else "")
+    # Communication
+    ax.barh(y, comm_end_s - comm_start_s, bar_h, left=comm_start_s,
+            color=COMM_COLOR, alpha=0.85, zorder=4,
+            label="Communication (all_reduce)" if y == 1 else "")
+    # Gradient sync tail (only if comm extends past backward)
+    tail = comm_end_s - bwd_s
+    if tail > 0.005:
+        ax.barh(y, tail, bar_h, left=bwd_s, color=COMM_COLOR, alpha=0.35,
+                zorder=4, hatch="///")
 
-    ax.set_xlim(0, t_max)
-    ax.set_ylim(0, 1)
-    ax.set_yticks([])
-    ax.tick_params(colors=MUTED, labelsize=9)
-    ax.set_xlabel("Time (seconds)", color=INK, fontsize=9)
-    for spine in ax.spines.values():
-        spine.set_edgecolor(GRIDLINE)
-        spine.set_linewidth(0.5)
-
-    # Legend
-    from matplotlib.patches import Patch
-    legend_patches = [
-        Patch(facecolor=COMPUTE_COLOR, alpha=0.7, label="Compute (matmul, elemwise, …)"),
-        Patch(facecolor=COMM_COLOR, alpha=0.7, label="Communication (NCCL all_reduce)"),
-    ]
-    ax.legend(handles=legend_patches, fontsize=8, framealpha=0.85,
-              edgecolor=GRIDLINE, loc="upper right")
+    # Annotations
+    ax.text(bwd_s / 2, y, f"backward\n{bwd_s:.3f}s", ha="center", va="center",
+            fontsize=10, color="white", fontweight="bold")
+    comm_mid = (comm_start_s + comm_end_s) / 2
+    comm_w = comm_end_s - comm_start_s
+    if comm_w > 0.06:
+        ax.text(comm_mid, y, f"comm\n{comm_w:.3f}s", ha="center", va="center",
+                fontsize=10, color="white", fontweight="bold")
+    # Total label
+    total = bwd_s + max(0, tail) + sync_s  # rough total
+    ax.text(bwd_s + max(0, tail) + 0.015, y, f"{label}", va="center",
+            fontsize=11, fontweight="bold", color=INK)
 
 
 def main() -> None:
-    naive_kerns  = load_kernels(NAIVE_SQLITE)
-    overlap_kerns = load_kernels(OVERLAP_SQLITE)
-
-    if not naive_kerns or not overlap_kerns:
-        print("[plot] ERROR: missing nsys data — run nsys profile first")
-        return
-
-    # Find a time window containing one training step.
-    # We take the second half of the trace (after warmup).
-    t_max_naive  = naive_kerns[-1][1]
-    t_max_overlap = overlap_kerns[-1][1]
-    t_mid_naive  = t_max_naive * 0.45
-    t_mid_overlap = t_max_overlap * 0.45
-
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(13, 5.5))
+    # ── Figure layout ──
+    fig = plt.figure(figsize=(13, 7.5))
     fig.patch.set_facecolor(SURFACE)
 
-    plot_timeline(ax1, naive_kerns, "NaiveDDP — backward then all_reduce (serial)",
-                  t_max_naive)
-    plot_timeline(ax2, overlap_kerns, "OverlapDDP — all_reduce during backward (overlapped)",
-                  t_max_overlap)
+    gs = fig.add_gridspec(3, 1, height_ratios=[1, 1, 1.3], hspace=0.35)
 
-    # Add alignment markers
-    for ax in (ax1, ax2):
-        # Mark warmup ↔ measured boundary (approximate)
-        pass
+    ax_gantt  = fig.add_subplot(gs[0])
+    ax_naive  = fig.add_subplot(gs[1])
+    ax_overlap = fig.add_subplot(gs[2])
+
+    # ────────────────────────────────────────────────────────
+    # Row 0: Gantt chart from benchmark numbers
+    # ────────────────────────────────────────────────────────
+    ax_gantt.set_facecolor(SURFACE)
+    ax_gantt.set_title("Schematic (benchmark timings)", color=INK,
+                       fontsize=12, fontweight="bold", loc="left")
+
+    # NaiveDDP
+    plot_gantt(ax_gantt, 1, "NaiveDDP", NAIVE_BWD, 0,
+               NAIVE_BWD, NAIVE_BWD + NAIVE_SYNC)
+    # OverlapDDP — comm starts after ~20% of backward, ends ~20ms after backward
+    comm_start_o = OVERLAP_BWD * 0.15
+    comm_end_o   = OVERLAP_BWD + OVERLAP_SYNC
+    plot_gantt(ax_gantt, 0, "OverlapDDP", OVERLAP_BWD, OVERLAP_SYNC,
+               comm_start_o, comm_end_o)
+
+    ax_gantt.set_ylim(-0.7, 1.7)
+    ax_gantt.set_yticks([0, 1])
+    ax_gantt.set_yticklabels([])
+    ax_gantt.set_xlim(0, NAIVE_BWD + NAIVE_SYNC + 0.12)
+    ax_gantt.set_xlabel("Time (seconds)", color=INK, fontsize=9)
+    ax_gantt.tick_params(colors=MUTED, labelsize=9)
+    for spine in ax_gantt.spines.values():
+        spine.set_edgecolor(GRIDLINE); spine.set_linewidth(0.5)
+
+    # Labels on y-axis
+    ax_gantt.text(-0.03, 1, "NaiveDDP", va="center", ha="right",
+                  fontsize=11, fontweight="bold", color=INK, transform=ax_gantt.get_yaxis_transform())
+    ax_gantt.text(-0.03, 0, "OverlapDDP", va="center", ha="right",
+                  fontsize=11, fontweight="bold", color=INK, transform=ax_gantt.get_yaxis_transform())
+
+    # Legend
+    from matplotlib.patches import Patch
+    ax_gantt.legend(
+        handles=[
+            Patch(facecolor=COMPUTE_COLOR, alpha=0.85, label="Compute (backward)"),
+            Patch(facecolor=COMM_COLOR, alpha=0.85, label="Communication (all_reduce)"),
+        ],
+        fontsize=9, framealpha=0.9, edgecolor=GRIDLINE,
+        loc="lower right", ncol=2,
+    )
+
+    # ────────────────────────────────────────────────────────
+    # Row 1-2: Kernel activity density from nsys
+    # ────────────────────────────────────────────────────────
+    for ax, sqlite_path, label in [
+        (ax_naive,   NAIVE_SQLITE,   "NaiveDDP — Nsight kernel activity density"),
+        (ax_overlap, OVERLAP_SQLITE, "OverlapDDP — Nsight kernel activity density"),
+    ]:
+        ax.set_facecolor(SURFACE)
+        t0_ns, t1_ns = _find_step_window(sqlite_path)
+        centers, comp, comm = kernel_density(sqlite_path, t0_ns, t1_ns)
+
+        if len(centers) > 0:
+            # Shade compute area
+            ax.fill_between(centers, 0, comp, color=COMPUTE_COLOR, alpha=0.35,
+                            linewidth=0, label="Compute kernels")
+            # Line for comm (on top, more visible)
+            ax.fill_between(centers, 0, comm, color=COMM_COLOR, alpha=0.55,
+                            linewidth=0, label="NCCL kernels")
+            # Smooth comm line
+            if np.max(comm) > 0:
+                ax.plot(centers, comm, color=COMM_COLOR, linewidth=1.2, alpha=0.9)
+
+        ax.set_title(label, color=INK, fontsize=11, fontweight="bold", loc="left")
+        ax.set_ylabel("kernels / bin", color=INK, fontsize=8)
+        ax.set_xlabel("Time relative to step start (s)", color=INK, fontsize=9)
+        ax.tick_params(colors=MUTED, labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_edgecolor(GRIDLINE); spine.set_linewidth(0.5)
+        ax.legend(fontsize=8, framealpha=0.85, edgecolor=GRIDLINE,
+                  loc="upper right")
 
     fig.suptitle(
-        "Nsight Timeline: NaiveDDP vs OverlapDDP — 2× RTX PRO 6000 Blackwell, xl model",
+        "Backward–Communication Overlap: NaiveDDP vs OverlapDDP\n"
+        "xl model, 2× RTX PRO 6000 Blackwell, Nsight Systems trace",
         color=INK, fontsize=13, fontweight="bold", y=1.01,
     )
-    fig.tight_layout(pad=2)
+    fig.tight_layout(pad=3)
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(OUT_PATH, dpi=200, facecolor=SURFACE, edgecolor="none", bbox_inches="tight")
     plt.close(fig)
