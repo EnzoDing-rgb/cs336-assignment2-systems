@@ -5,10 +5,6 @@
 # Measures:
 #   (a) Single-GPU baseline (no DDP, pure local training)
 #   (b) 2-GPU NaiveDDP (per-parameter gradient all-reduce, ~291 calls per step)
-#   (c) 2-GPU FlattenDDP (single batched all-reduce for all gradients)
-#
-# Each configuration runs in its own subprocess so GPU memory is cleanly
-# released by the OS on process exit — no cross-run leaks.
 #
 # Sweeps batch sizes [4, 8, 16, 32, 64] for the xl model (Section 2.1.2).
 # Timed segments per step: forward | loss | backward | gradient_sync | optimizer.
@@ -53,6 +49,11 @@ VOCAB_SIZE = 10_000
 CONTEXT_LENGTH = 512
 SEED = 0
 
+# Single-GPU OOMs above batch=8 (72 GB at bs=8, >95 GB at bs=16).
+# DDP per-GPU batch = total / 2, so DDP OOMs above total=16.
+SINGLE_BATCH_LIMIT = 8
+DDP_BATCH_LIMIT = 16
+
 XL_HPARAMS = {
     "d_model": 2560,
     "d_ff": 10240,
@@ -86,13 +87,20 @@ def _sync(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def _free_all(device: torch.device) -> None:
+    """Aggressively release GPU memory and run Python GC."""
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize(device)
+
+
 def _build_model(device: torch.device) -> BasicsTransformerLM:
-    model = BasicsTransformerLM(
+    return BasicsTransformerLM(
         vocab_size=VOCAB_SIZE,
         context_length=CONTEXT_LENGTH,
         **XL_HPARAMS,
-    )
-    return model.to(device)
+    ).to(device)
 
 
 def _make_batch(
@@ -104,7 +112,7 @@ def _make_batch(
 
 
 def _timed_train_step(
-    model: BasicsTransformerLM | NaiveDDP,
+    model,
     optimizer: AdamW,
     x: torch.Tensor,
     y: torch.Tensor,
@@ -147,6 +155,8 @@ def _timed_train_step(
     _sync(device)
     optimizer_s = timeit.default_timer() - t0
 
+    # Help Python reclaim activation memory from this step.
+    del logits, loss
     return {
         "forward": forward_s,
         "loss": loss_s,
@@ -167,6 +177,7 @@ def _measure_per_param_all_reduce(
     logits = model(x)
     loss = cross_entropy(logits, y)
     loss.backward()
+    del logits, loss
 
     inner = model.module
     world_size = dist.get_world_size()
@@ -189,17 +200,15 @@ def _measure_per_param_all_reduce(
 
 
 # ---------------------------------------------------------------------------
-# Single-GPU worker (runs in its own process)
+# Single-GPU benchmark (runs in-process with cleanup)
 # ---------------------------------------------------------------------------
-def _single_gpu_worker(
-    batch_size: int,
-    output_csv: str,
-) -> None:
-    """Run single-GPU benchmark in an isolated process."""
+def run_single_gpu(batch_size: int, output_csv: Path) -> list[StepRecord]:
     device = torch.device("cuda:0")
     torch.cuda.set_device(0)
     torch.manual_seed(SEED)
     torch.cuda.manual_seed_all(SEED)
+
+    print(f"\n── Single-GPU · batch={batch_size} ──", flush=True)
 
     model = _build_model(device)
     model.train()
@@ -207,48 +216,37 @@ def _single_gpu_worker(
     x, y = _make_batch(batch_size, device)
     records: list[StepRecord] = []
 
-    # Warmup
-    for i in range(WARMUP_STEPS):
-        _timed_train_step(model, optimizer, x, y, device, do_gradient_sync=False)
-        print(f"  warmup {i + 1}/{WARMUP_STEPS}")
+    try:
+        # Warmup
+        for i in range(WARMUP_STEPS):
+            _timed_train_step(model, optimizer, x, y, device, do_gradient_sync=False)
+            print(f"  warmup {i + 1}/{WARMUP_STEPS}")
 
-    # Measurement
-    for i in range(MEASURE_STEPS):
-        segs = _timed_train_step(model, optimizer, x, y, device, do_gradient_sync=False)
-        total = sum(segs.values())
-        rec = StepRecord(
-            mode="single", batch_size=batch_size, step=i, rank=0,
-            forward_s=segs["forward"], loss_s=segs["loss"],
-            backward_s=segs["backward"], gradient_sync_s=0.0,
-            optimizer_s=segs["optimizer"], total_s=total,
-        )
-        records.append(rec)
-        print(
-            f"  step {i + 1:>2}/{MEASURE_STEPS}  "
-            f"fwd={segs['forward']:.3f}s  loss={segs['loss']:.3f}s  "
-            f"bwd={segs['backward']:.3f}s  opt={segs['optimizer']:.3f}s  "
-            f"sum={total:.3f}s"
-        )
+        # Measurement
+        for i in range(MEASURE_STEPS):
+            segs = _timed_train_step(model, optimizer, x, y, device, do_gradient_sync=False)
+            total = sum(segs.values())
+            rec = StepRecord(
+                mode="single", batch_size=batch_size, step=i, rank=0,
+                forward_s=segs["forward"], loss_s=segs["loss"],
+                backward_s=segs["backward"], gradient_sync_s=0.0,
+                optimizer_s=segs["optimizer"], total_s=total,
+            )
+            records.append(rec)
+            print(
+                f"  step {i + 1:>2}/{MEASURE_STEPS}  "
+                f"fwd={segs['forward']:.3f}s  loss={segs['loss']:.3f}s  "
+                f"bwd={segs['backward']:.3f}s  opt={segs['optimizer']:.3f}s  "
+                f"sum={total:.3f}s"
+            )
 
-    _append_csv(Path(output_csv), records)
-    # Process exit releases all GPU memory automatically.
+        _append_csv(output_csv, records)
+    finally:
+        del optimizer, x, y
+        del model
+        _free_all(device)
 
-
-def run_single_gpu(batch_size: int, output_csv: Path) -> list[StepRecord]:
-    """Launch single-GPU benchmark in a subprocess; return loaded records."""
-    print(f"\n── Single-GPU · batch={batch_size} ──", flush=True)
-    ctx = mp.get_context("spawn")
-    proc = ctx.Process(
-        target=_single_gpu_worker,
-        args=(batch_size, str(output_csv)),
-    )
-    proc.start()
-    proc.join()
-    if proc.exitcode != 0:
-        raise RuntimeError(
-            f"Single-GPU worker (batch={batch_size}) exited with code {proc.exitcode}"
-        )
-    return _load_records(output_csv, mode="single", batch_size=batch_size)
+    return records
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +259,6 @@ def _ddp_worker(
     master_port: str,
     output_csv: str,
     per_param_csv: str | None,
-    ddp_mode: str = "naive",
 ) -> None:
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = master_port
@@ -276,13 +273,7 @@ def _ddp_worker(
     try:
         model = _build_model(device)
         model.train()
-
-        if ddp_mode == "flatten":
-            from cs336_systems.distributed.flatten_ddp import FlattenDDP
-            ddp_model = FlattenDDP(model)
-        else:
-            ddp_model = NaiveDDP(model)
-
+        ddp_model = NaiveDDP(model)
         optimizer = AdamW(ddp_model.parameters())
         per_rank_batch = batch_size // world_size
         x, y = _make_batch(per_rank_batch, device)
@@ -299,7 +290,7 @@ def _ddp_worker(
             segs = _timed_train_step(ddp_model, optimizer, x, y, device, do_gradient_sync=True)
             total = sum(segs.values())
             rec = StepRecord(
-                mode=f"{ddp_mode}_ddp", batch_size=batch_size, step=i, rank=rank,
+                mode="naive_ddp", batch_size=batch_size, step=i, rank=rank,
                 forward_s=segs["forward"], loss_s=segs["loss"],
                 backward_s=segs["backward"],
                 gradient_sync_s=segs["gradient_sync"],
@@ -315,7 +306,7 @@ def _ddp_worker(
                 )
 
         # Per-parameter timing (separate step, rank 0 only)
-        if per_param_csv is not None and rank == 0 and ddp_mode == "naive":
+        if per_param_csv is not None and rank == 0:
             print("  recording per-parameter all_reduce latencies …")
             pp_data = _measure_per_param_all_reduce(ddp_model, x, y, optimizer, device)
             pp_path = Path(per_param_csv)
@@ -329,7 +320,7 @@ def _ddp_worker(
         elif per_param_csv is not None:
             _timed_train_step(ddp_model, optimizer, x, y, device, do_gradient_sync=True)
 
-        # Gather
+        # Gather records across ranks
         gathered: list[list[StepRecord] | None] = [None for _ in range(world_size)]
         dist.all_gather_object(gathered, local_records)
 
@@ -343,7 +334,8 @@ def _ddp_worker(
     finally:
         dist.barrier()
         dist.destroy_process_group()
-        # Process exit releases memory.
+        del optimizer, ddp_model, model, x, y
+        _free_all(device)
 
 
 def run_ddp(
@@ -351,24 +343,25 @@ def run_ddp(
     output_csv: Path,
     master_port: int,
     *,
-    ddp_mode: str = "naive",
     record_per_param: bool = False,
 ) -> list[StepRecord]:
     world_size = 2
     per_rank = batch_size // world_size
-    label = {"naive": "NaiveDDP", "flatten": "FlattenDDP"}[ddp_mode]
-    print(f"\n── {label} 2-GPU · total_batch={batch_size} (per_rank={per_rank}) · port={master_port} ──", flush=True)
+    print(f"\n── NaiveDDP 2-GPU · total_batch={batch_size} (per_rank={per_rank}) · port={master_port} ──", flush=True)
 
-    pp_csv = str(PER_PARAM_CSV) if (record_per_param and ddp_mode == "naive") else None
+    pp_csv = str(PER_PARAM_CSV) if record_per_param else None
 
     mp.spawn(
         fn=_ddp_worker,
-        args=(world_size, batch_size, str(master_port), str(output_csv), pp_csv, ddp_mode),
+        args=(world_size, batch_size, str(master_port), str(output_csv), pp_csv),
         nprocs=world_size,
         join=True,
     )
 
-    return _load_records(output_csv, mode=f"{ddp_mode}_ddp", batch_size=batch_size)
+    # Parent-process cleanup after DDP spawn
+    _free_all(torch.device("cuda:0"))
+
+    return _load_records(output_csv, mode="naive_ddp", batch_size=batch_size)
 
 
 # ---------------------------------------------------------------------------
@@ -445,8 +438,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output", default=str(OUTPUT_CSV))
     p.add_argument("--skip-single", action="store_true")
     p.add_argument("--skip-ddp", action="store_true")
-    p.add_argument("--ddp-mode", choices=("naive", "flatten"), default="naive",
-                   help="DDP strategy: naive (per-param all-reduce) or flatten (single batched).")
     p.add_argument("--no-per-param", action="store_true")
     return p.parse_args()
 
@@ -464,31 +455,25 @@ def main() -> None:
     for i, bs in enumerate(args.batch_sizes):
         port = args.master_port + i
 
-        # ---- Single-GPU baseline (subprocess) ----
+        # ---- Single-GPU baseline ----
         if not args.skip_single:
-            try:
+            if bs > SINGLE_BATCH_LIMIT:
+                print(f"\n── Single-GPU · batch={bs} ── SKIPPED (> {SINGLE_BATCH_LIMIT}, expected OOM)", flush=True)
+            else:
                 records = run_single_gpu(bs, output_csv)
                 print_summary(records)
-            except RuntimeError as e:
-                if "OOM" in str(e) or "out of memory" in str(e).lower():
-                    print(f"  ✗ Single-GPU batch={bs}: OOM ({e})")
-                else:
-                    raise
 
-        # ---- 2-GPU DDP ----
+        # ---- 2-GPU NaiveDDP ----
         if not args.skip_ddp:
-            do_pp = (not args.no_per_param) and (i == 0) and (args.ddp_mode == "naive")
-            try:
+            if bs > DDP_BATCH_LIMIT:
+                print(f"\n── NaiveDDP 2-GPU · batch={bs} ── SKIPPED (> {DDP_BATCH_LIMIT}, expected OOM)", flush=True)
+            else:
+                do_pp = (not args.no_per_param) and (i == 0)
                 records = run_ddp(
                     bs, output_csv, master_port=port,
-                    ddp_mode=args.ddp_mode, record_per_param=do_pp,
+                    record_per_param=do_pp,
                 )
                 print_summary(records)
-            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
-                if "OOM" in str(e) or "out of memory" in str(e).lower():
-                    print(f"  ✗ NaiveDDP batch={bs}: OOM ({e})")
-                else:
-                    raise
 
     print(f"\n✓ All results → {output_csv}")
     if PER_PARAM_CSV.exists():
