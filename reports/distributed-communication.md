@@ -457,3 +457,55 @@ ZeRO Stage 1（Pos）和我们的 ShardedOptimizer 都做 optimizer state 分片
 2. **权重同步方式。** 我们每步用逐个参数的 broadcast 把更新后的权重同步到所有卡。ZeRO-1 标准做法是用一次 `all_gather`（或 reduce-scatter 的逆操作）批量化完成——这避免了 291 次独立调用带来的固定开销。这也是我们 optimizer step 慢 69% 的根因：用 broadcast 而非 all_gather。
 
 **代码：** `cs336_systems/distributed/benchmarking/benchmark_sharded_optimizer.py`
+
+---
+
+## 9. FSDP：参数分片、all-gather 与显存极限压缩
+
+ShardedOptimizer（§8）只分片了 optimizer state，参数和梯度仍每卡全量。FSDP 再进一步——**Linear / Embedding 的 weight 平时只存 1/N 分片**。前向/反向计算该层前用 `all_gather` 临时拼出完整权重，算完立即释放。梯度用 `reduce-scatter` 只保留本地分片。optimizer state 沿用 `ShardedOptimizer`，天然只覆盖本地参数。
+
+### 9.1 显存账本
+
+| 组件 | DDP baseline | FSDP 2-way | FSDP 4-way |
+|------|:-----------:|:----------:|:----------:|
+| Parameters | 13.6 GB（全量） | 6.8 GB（分片） | 3.4 GB（分片） |
+| Gradients | 13.6 GB（全量） | 6.8 GB（reduce-scatter） | 3.4 GB（reduce-scatter） |
+| Adam m+v | 27.3 GB（全量） | 13.6 GB（ShardedOpt） | 6.8 GB（ShardedOpt） |
+| Activations | ~11 GB | ~11 GB | ~11 GB |
+| **params+grads+opt 小计** | **54.5 GB** | **27.2 GB** | **13.6 GB** |
+| **含激活峰值** | **~52 GB** | **~39 GB** | **~25 GB** |
+
+BF16 模式将通信量和计算精度各减半，进一步压缩。all-gather buffer 的大小（单层完整权重，~100–200 MB）未计入——题目允许忽略。
+
+### 9.2 实测
+
+<img src="figures/fsdp_comparison.png" alt="fsdp_comparison.png" width="740" style="margin: 12px 0;" />
+
+| 配置 | Peak (GiB) | Savings vs baseline | Total step (s) | vs baseline |
+|------|----------:|--------------------:|---------------:|------------:|
+| DDP baseline | 52.1 | — | 1.122 | — |
+| FSDP 2-GPU FP32 | 39.3 | −12.8 (−24%) | 1.353 | +0.231 (+21%) |
+| FSDP 4-GPU FP32 | 24.6 | −27.5 (−53%) | 1.354 | +0.232 (+21%) |
+| FSDP 2-GPU BF16 | 29.3 | −22.8 (−44%) | 0.923 | −0.199 (−18%) |
+| FSDP 4-GPU BF16 | 17.4 | −34.7 (−67%) | 0.923 | −0.199 (−18%) |
+
+### 9.3 分析
+
+**(a) 显存。** FSDP 4-way FP32 将 params+grads+opt 从 54.5 GB 压到 13.6 GB——4× 缩减，与分片数一致。实测峰值 24.6 GB，比理论值 13.6 + 11（激活）≈ 24.6 GB 完全吻合。BF16 模式下通信量再减半，4-way BF16 峰值仅 17.4 GB——是 baseline 的 1/3。在 24 GB 消费级卡上，FSDP 4-way BF16 是唯一能跑 xl 模型的配置。
+
+**(b) 速度——为什么 FP32 更慢。** FSDP 的每一步要多做两件事：前向时每层 `all_gather`（N 张卡拼完整权重）、反向时每层 `reduce-scatter`（N 张卡各取自己那截梯度）。FP32 下 all-gather 的通信量约等于一次额外的梯度同步，且与计算无法完全重叠——forward matmul 必须等都拼完才能开始。所以总步时间比 DDP baseline 慢 21%。但梯度同步段（`gradient_sync`）几乎为零（~10 ms）——reduce-scatter 已在 backward 的 hook 里异步完成，和 OverlapDDP 同一个原理。
+
+**(c) BF16 为什么反而更快。** BF16 把 all-gather 通信量减半，同时 matmul 走 Tensor Core——forward 从 0.317s 降到 0.149s（2-GPU）、backward 从 0.803s 降到 0.544s——通信和计算两边都受益。最终 BF16 FSDP 比 FP32 DDP baseline 还快 18%：**省了 44% 显存的同时还更快**。
+
+**(d) 2-GPU vs 4-GPU。** 4-GPU 的理论通信量更大（每个 all-gather 要从 4 个分片拼而非 2 个），但每 GPU 的 batch size 也从 2 降到 1——计算量减半。两者恰好抵消：2-GPU 和 4-GPU 的 total step time 几乎一样（~1.354s FP32、~0.923s BF16）。说明 all-gather 的通信开销和减少的计算量在同一数量级，pre-fetch i+2 的策略成功地藏住了大部分通信延迟。
+
+**(e) 与 ZeRO-3 的比较。** FSDP 等价于 ZeRO Stage 3——参数、梯度、optimizer state 三层分片。差异在于我们的实现没有释放非本地梯度（reduce-scatter 后只保留本地截），且权重同步走 broadcast（ZeRO-3 标准用 all-gather 批量同步）。
+
+### 9.4 结论
+
+- FSDP 4-way BF16 将 xl 模型峰值显存从 52 GiB 压到 **17.4 GiB（−67%）**，同时比 FP32 DDP baseline 快 **18%**
+- FP32 FSDP 比 baseline 慢 21%——all-gather / reduce-scatter 的额外通信代价
+- BF16 同时压缩通信量和加速计算，是 FSDP 的"甜点"配置
+- 2-GPU vs 4-GPU 的步时间持平——通信量增加和计算量减少相互抵消，pre-fetch 机制有效
+
+**代码：** `cs336_systems/distributed/benchmarking/benchmark_fsdp.py`
