@@ -4,7 +4,7 @@
 
 **设定：** 每张 GPU 持有一份 `float32` 随机张量，`dist.all_reduce(op=SUM)` 逐元素求和后每张卡拿到完全相同的最终结果。只测通信，不做训练。
 
-**代码：** `cs336_systems/distributed/benchmark_all_reduce_single_node.py` · **画图：** `cs336_systems/distributed/plot_all_reduce.py` · **数据：** `artifacts/all_reduce_single_node.csv`
+**代码：** `cs336_systems/distributed/benchmarking/benchmark_all_reduce_single_node.py` · **画图：** `cs336_systems/distributed/benchmarking/plot_all_reduce.py` · **数据：** `artifacts/all_reduce_single_node.csv`
 
 ---
 
