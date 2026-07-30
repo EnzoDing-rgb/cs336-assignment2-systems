@@ -223,3 +223,63 @@ N = 4、1 MB 总耗时 106 μs。按 bus BW 33 GB/s 算，1.5 MB（N = 4 时每 
 | CPU 发令 | 4 个进程各自走 PyTorch→NCCL→CUDA driver 路径，都通过同一个 PCIe Root Complex 发 doorbell，MMIO 窗口竞争 |
 
 GPU kernel 启动这步是各 GPU 并行完成的，不互相等待，因此不随 N 增长。
+
+---
+
+## 6. DDP 梯度同步：逐参数 vs. 单次批量化
+
+本节比较两种 DDP 梯度同步策略在真实训练步中的通信耗时。实验设定与第 1–5 节的微基准不同：不再是孤立调用 `all_reduce`，而是在完整的前向→反向→梯度同步→优化器步中测量。
+
+### 6.1 两种策略
+
+| 策略 | 实现 | 做法 |
+|------|------|------|
+| NaiveDDP | `naive_ddp.py` | 对模型每一个 parameter 的 `.grad` 各调一次 `all_reduce`。xl 模型有 291 个 parameter → **291 次 all_reduce 调用** |
+| FlattenDDP | `flatten_ddp.py` | 把所有 `.grad` 拼接成一条长向量，调**一次** `all_reduce`，再拆回各 parameter |
+
+两种策略传输的总字节数完全相同（所有 parameter 梯度的字节之和），差别在于：291 次小消息 vs. 1 次大消息。
+
+### 6.2 实验设定
+
+| 项目 | 取值 |
+|------|------|
+| 模型 | BasicsTransformerLM, xl 配置（d_model=2560, d_ff=10240, num_layers=32, num_heads=32） |
+| 参数总量 | ~2.1B 参数，FP32 → 梯度总字节 ~8.4 GB |
+| GPU | 2× RTX PRO 6000 Blackwell, NCCL, PHB 互联 |
+| 每 GPU batch size | 2（总 batch = 4） |
+| context length | 512 |
+| warmup | 5 步（丢弃） |
+| 计时步数 | 10 步，每步分段 cuda.synchronize + timeit.default_timer |
+
+计时分段：forward → loss → backward → **gradient_sync** → optimizer。
+
+### 6.3 结果
+
+| 分段 | NaiveDDP（291 次 all_reduce） | FlattenDDP（1 次 all_reduce） | 差值 |
+|------|------------------------------:|-------------------------------:|-----:|
+| forward | 0.156 s (13.9%) | 0.155 s (13.4%) | −0.001 s |
+| loss | <0.001 s (0.0%) | <0.001 s (0.0%) | — |
+| backward | 0.295 s (26.3%) | 0.297 s (25.7%) | +0.002 s |
+| **gradient_sync** | **0.398 s (35.5%)** | **0.430 s (37.3%)** | **+0.032 s** |
+| optimizer | 0.272 s (24.3%) | 0.273 s (23.6%) | +0.001 s |
+| **total** | **1.122 s** | **1.156 s** | **+0.034 s** |
+
+### 6.4 分析
+
+FlattenDDP 的 gradient_sync 比 NaiveDDP 慢了 **0.032 s（8%）**，而不是更快。这个结果初看反直觉——1 次大消息应该比 291 次小消息高效。原因在于梯度总量 ~8.4 GB 非常大，这里发生的事和我们第 4 节测到的规律一致：
+
+**大消息时，总通信时间由带宽决定，调用次数几乎不影响。** 两种策略传输的总字节完全相同（~8.4 GB），因此在同一硬件总线带宽下通信时间理应接近。291 次调用的固定开销总和约为 `291 × 30 μs ≈ 8.7 ms`，而实测总通信时间约 400 ms，固定开销占比不到 3%。
+
+FlattenDDP 反而略慢，根因是 **flatten 操作本身的代价**：`_flatten_dense_tensors` 需要把所有 grad 在内存中首尾相接拷贝到一块连续的 flat buffer，传输完成后再用 `_unflatten_dense_tensors` 拆回、逐块 `copy_` 回原 grad。8.4 GB 的数据多了一次全量内存拷贝（flatten）+ 一次全量写回（unflatten），这几十毫秒的额外开销盖过了省掉的 290 次 kernel launch。
+
+**NaiveDDP 在 xl 模型上更快，是因为 NCCL 对大批量短消息做了内部合并。** NCCL 的环形算法天然会把环上同时到达的小消息聚合成大块传输——当连续发出 291 次 `all_reduce` 时，NCCL 内部可以将这些请求流水线化，实际在 PCIe 上的行为和发送少量大消息接近。
+
+### 6.5 结论
+
+在单机 2 卡、xl 规模模型（梯度总量 ~8.4 GB）的条件下：
+
+- 逐参数 all_reduce（NaiveDDP）与单次批量 all_reduce（FlattenDDP）的通信耗时接近（0.398 s vs 0.430 s），因为总字节数相同、带宽主导
+- FlattenDDP 的额外 flatten/unflatten 内存拷贝开销抵消了减少调用次数的收益
+- **结论：大模型梯度同步的瓶颈是带宽（字节量），不是调用次数。减少 all_reduce 次数对通信耗时影响甚微，除非同步降低传输的总字节数。**
+
+**代码：** `cs336_systems/distributed/benchmarking/benchmark_naive_ddp.py`（`--ddp-mode naive|flatten`）
