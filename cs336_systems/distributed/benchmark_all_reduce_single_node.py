@@ -31,11 +31,11 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-# 作业里写的「1MB」我们按 2^20 字节（MiB）理解，避免和 10^6 混淆。
-_MIB = 1024 * 1024
+# 作业里写的「1MB」按 10^6 字节理解。
+_MB = 1000 * 1000
 
-# 默认扫的数据量（单位：MiB）。1GB = 1024 MiB。
-_DEFAULT_SIZES_MIB = (1, 10, 100, 1024)
+# 默认扫的数据量（单位：MB）。1 GB = 1000 MB。
+_DEFAULT_SIZES_MB = (1, 10, 100, 1000)
 
 
 @dataclass
@@ -44,7 +44,7 @@ class BenchRow:
 
     backend: str
     world_size: int
-    size_mib: int
+    size_mb: int
     numel: int
     bytes: int
     warmup: int
@@ -154,7 +154,7 @@ def worker(
     rank: int,
     world_size: int,
     backend: str,
-    sizes_mib: list[int],
+    sizes_mb: list[int],
     warmup: int,
     iters: int,
     master_port: str,
@@ -170,11 +170,11 @@ def worker(
     # 这个进程本地攒的「每个 size 的平均耗时（秒）」。
     # 稍后用 all_gather_object 跟别的 rank 交换，才能算跨 rank 的 mean/min/max。
     local_mean_s: list[float] = []
-    meta: list[tuple[int, int, int]] = []  # (size_mib, numel, nbytes)
+    meta: list[tuple[int, int, int]] = []  # (size_mb, numel, nbytes)
 
     try:
-        for size_mib in sizes_mib:
-            nbytes = size_mib * _MIB
+        for size_mb in sizes_mb:
+            nbytes = size_mb * _MB
             numel = _size_bytes_to_numel(nbytes)
 
             # 每个 rank 各自持有一份同样 shape 的 float32 数据。
@@ -188,9 +188,9 @@ def worker(
                 iters=iters,
             )
             local_mean_s.append(mean_s)
-            meta.append((size_mib, numel, nbytes))
+            meta.append((size_mb, numel, nbytes))
 
-            # 及时释放，避免扫到 1GB 时显存/内存叠太多份残留。
+            # 及时释放，避免扫到 1 GB 时显存/内存叠太多份残留。
             del tensor
             if device.type == "cuda":
                 torch.cuda.empty_cache()
@@ -204,7 +204,7 @@ def worker(
         if rank == 0:
             assert all(g is not None for g in gathered)
             rows: list[BenchRow] = []
-            for i, (size_mib, numel, nbytes) in enumerate(meta):
+            for i, (size_mb, numel, nbytes) in enumerate(meta):
                 # gathered[r][i] = rank r 在第 i 个 size 上测到的平均秒数
                 per_rank_ms = [gathered[r][i] * 1e3 for r in range(world_size)]  # type: ignore[index]
                 mean_ms = sum(per_rank_ms) / len(per_rank_ms)
@@ -215,7 +215,7 @@ def worker(
                     BenchRow(
                         backend=backend,
                         world_size=world_size,
-                        size_mib=size_mib,
+                        size_mb=size_mb,
                         numel=numel,
                         bytes=nbytes,
                         warmup=warmup,
@@ -237,14 +237,14 @@ def worker(
 def _print_table(rows: list[BenchRow]) -> None:
     """人眼友好的小表；正式存档以 CSV 为准。"""
     hdr = (
-        f"{'backend':>6} {'N':>3} {'MiB':>5} {'ms_mean':>10} "
+        f"{'backend':>6} {'N':>3} {'MB':>5} {'ms_mean':>10} "
         f"{'ms_min':>10} {'ms_max':>10} {'GB/s~':>8}"
     )
     print(hdr)
     print("-" * len(hdr))
     for r in rows:
         print(
-            f"{r.backend:>6} {r.world_size:>3} {r.size_mib:>5} "
+            f"{r.backend:>6} {r.world_size:>3} {r.size_mb:>5} "
             f"{r.latency_ms_mean:>10.3f} {r.latency_ms_min:>10.3f} "
             f"{r.latency_ms_max:>10.3f} {r.approx_alg_bandwidth_GBps:>8.3f}"
         )
@@ -271,8 +271,8 @@ def parse_args() -> argparse.Namespace:
         "--world-size",
         type=int,
         nargs="+",
-        default=[2, 4, 6],
-        help="要测的进程数/GPU 数列表。默认：2 4 6。每次只 spawn 其中一个 N。",
+        default=[2, 4],
+        help="要测的进程数/GPU 数列表。默认：2 4。每次只 spawn 其中一个 N。",
     )
     p.add_argument(
         "--backend",
@@ -281,14 +281,14 @@ def parse_args() -> argparse.Namespace:
         help="正式多卡用 nccl；本机没多卡时可改 gloo 做流程冒烟。",
     )
     p.add_argument(
-        "--sizes-mib",
+        "--sizes-mb",
         type=int,
         nargs="+",
-        default=list(_DEFAULT_SIZES_MIB),
-        help="数据量列表，单位 MiB（2^20 字节）。默认：1 10 100 1024。",
+        default=list(_DEFAULT_SIZES_MB),
+        help="数据量列表，单位 MB（10^6 字节）。默认：1 10 100 1000。",
     )
     p.add_argument("--warmup", type=int, default=5, help="每个配置正式计时前的 warmup 次数。")
-    p.add_argument("--iters", type=int, default=10, help="每个配置正式计时的重复次数（取平均）。")
+    p.add_argument("--iters", type=int, default=20, help="每个配置正式计时的重复次数（取平均）。")
     p.add_argument(
         "--master-port",
         default="29501",
@@ -320,7 +320,7 @@ def main() -> None:
 
         print(
             f"\n=== spawn world_size={world_size} backend={args.backend} "
-            f"sizes_mib={args.sizes_mib} warmup={args.warmup} iters={args.iters} ==="
+            f"sizes_mb={args.sizes_mb} warmup={args.warmup} iters={args.iters} ==="
         )
 
         # mp.spawn：起 world_size 个进程，每个跑 worker(rank, world_size, ...)。
@@ -329,7 +329,7 @@ def main() -> None:
             args=(
                 world_size,
                 args.backend,
-                list(args.sizes_mib),
+                list(args.sizes_mb),
                 args.warmup,
                 args.iters,
                 args.master_port,

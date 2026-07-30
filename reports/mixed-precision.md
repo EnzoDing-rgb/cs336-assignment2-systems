@@ -60,15 +60,15 @@
 **设定：** `BasicsTransformerLM`；本次实测 size ∈ {medium, large, xl}；batch=4；context=512；warmup=5；measure=10；**不含** `optimizer.step()`；BF16 使用 `torch.autocast`，**无** GradScaler。计时复用 `e2e_timing` 的分段墙钟（`cuda.synchronize` + `nullcontext` / `autocast`）。Section 2.1.2 中的 `small` 未单独重跑（趋势已由 medium→xl 覆盖）；`10b` 在本机 80GB 上全精度会 OOM，故省略。
 
 <p align="center">
-  <img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/mixed_precision_forward.png" alt="forward FP32 vs BF16" width="560" />
+  <img src="figures/mixed_precision_forward.png" alt="forward FP32 vs BF16" width="560" />
 </p>
 
 <p align="center">
-  <img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/mixed_precision_backward.png" alt="backward FP32 vs BF16" width="560" />
+  <img src="figures/mixed_precision_backward.png" alt="backward FP32 vs BF16" width="560" />
 </p>
 
 <p align="center">
-  <img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/mixed_precision_speedup_vs_size.png" alt="speedup vs size" width="560" />
+  <img src="figures/mixed_precision_speedup_vs_size.png" alt="speedup vs size" width="560" />
 </p>
 
 | size | 精度 | forward mean | backward mean | forward speedup | backward speedup |

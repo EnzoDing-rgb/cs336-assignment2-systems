@@ -34,21 +34,21 @@ $$
 
 **仅前向（ctx=512, FP32）**
 
-<img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/memory_a_xl_ctx512_forward.png" alt="memory_a_xl_ctx512_forward" width="560" />
+<img src="figures/memory_a_xl_ctx512_forward.png" alt="memory_a_xl_ctx512_forward" width="560" />
 
 **完整训练步（ctx=512, FP32）**
 
-<img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/memory_a_xl_ctx512_train.png" alt="memory_a_xl_ctx512_train" width="560" />
+<img src="figures/memory_a_xl_ctx512_train.png" alt="memory_a_xl_ctx512_train" width="560" />
 
 **训练步各阶段 max_allocated（FP32）**
 
-<img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/memory_a_staged_peaks_fp32_train.png" alt="memory_a_staged_peaks_fp32_train" width="520" />
+<img src="figures/memory_a_staged_peaks_fp32_train.png" alt="memory_a_staged_peaks_fp32_train" width="520" />
 
 **解答 (a):** 前向-only 时间线在 forward pass 期间从参数地板爬升至约 **39.750 GiB** 的平台（激活堆叠），随后随释放而回落。完整训练步时间线基线已含参数与 AdamW（约 50.9 GiB）；forward 与 loss 阶段继续抬升至整步峰值 **65.538 GiB**；backward 呈台阶式下降（逐层释放为反向传播保存的中间张量），optimizer step 几乎平坦，因 Adam 状态在 warmup 时已分配。结合阶段竖线，可从峰值形状区分 **forward（爬升/高平台）→ backward（台阶下降）→ optimizer（平坦）**。
 
 ## (b) 各 context 下的峰值显存（forward pass vs full training step）
 
-<img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/memory_b_peaks_by_context.png" alt="peaks by context" width="560" />
+<img src="figures/memory_b_peaks_by_context.png" alt="peaks by context" width="560" />
 
 | context | forward pass peak (GiB) | full training step peak (GiB) |
 |--------:|------------------------:|------------------------------:|
@@ -61,7 +61,7 @@ $$
 
 ## (c) 混合精度下的峰值显存（BF16）
 
-<img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/memory_c_bf16_vs_fp32.png" alt="BF16 vs FP32 memory" width="640" />
+<img src="figures/memory_c_bf16_vs_fp32.png" alt="BF16 vs FP32 memory" width="640" />
 
 左图为 ctx=512 的实测峰值；右图将训练步峰值拆分为「模型参数 / Adam（始终为 FP32）」与「激活（仅 autocast 时才可能变窄）」的示意，说明即便激活理想减半，总峰值也远不会减半。
 
@@ -76,7 +76,7 @@ $$
 
 ## (d) Transformer residual stream 激活张量大小（单精度）
 
-<img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/memory_d_residual_stream.png" alt="residual stream size" width="640" />
+<img src="figures/memory_d_residual_stream.png" alt="residual stream size" width="640" />
 
 讲义 (d) 所求为 **residual stream** 上单张激活张量的大小：在各 `TransformerBlock` 之间传递、形状为 $(B,\,S,\,d_{\mathrm{model}})$ 的主干激活。xl 的 $d_{\mathrm{model}}=2560$；单精度 FP32 每元素占 4 bytes。体积为
 
@@ -94,7 +94,7 @@ $$
 
 ## (e) memory_viz 前向快照中的最大分配（调低 Detail）
 
-<img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/memory_e_attn_score_alloc.png" alt="attention score allocation" width="640" />
+<img src="figures/memory_e_attn_score_alloc.png" alt="attention score allocation" width="640" />
 
 对 xl forward pass（ctx=512, FP32）的 snapshot，在 memory_viz 中将 **Detail** 调低后，最小的分配被隐藏，留下最大的块。下表按 `alloc` 体积排序的前 5 项，与「仅显示最大若干 % 分配」时所见一致：
 
@@ -130,7 +130,7 @@ $$
 
 **步骤 A：看整步显存长什么样（Nsight 截图等价物）。**
 
-<img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/memory_f_nsys_cuda_mem.png" alt="memory_f_nsys_cuda_mem" width="560" />
+<img src="figures/memory_f_nsys_cuda_mem.png" alt="memory_f_nsys_cuda_mem" width="560" />
 
 这条曲线是 Nsight 从 CUDA 分配事件重建出来的。录制约 10.75 秒，峰值约 **67.61 GiB**。  
 注意：Nsight 按「cudaMalloc 段」记账，数字会略高于前面 PyTorch 的 `memory_allocated`（约 65.5 GiB），两者不是同一把尺子，但形状一致：前向堆高、反向台阶式下降。
@@ -140,7 +140,7 @@ $$
 我们取中间一层（第 16 层）为代表。前向经过这一层时，为反向一共保存了 **1565.7 MiB**（约 1.53 GiB），共 46 个张量。  
 按体积从大到小排前 5 名如下（名字是按张量形状归的类，方便理解「是哪一类东西」）：
 
-<img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/memory_f_residual_top5.png" alt="memory_f_residual_top5" width="520" />
+<img src="figures/memory_f_residual_top5.png" alt="memory_f_residual_top5" width="520" />
 
 | 排名 | 是什么 | 体积 (MiB) | 占这一层保存总量 |
 |-----:|--------|----------:|-----------------:|
@@ -194,7 +194,7 @@ $$
 G \approx \Delta + R \approx (-437) + 1566 = 1129\ \text{MiB}.
 $$
 
-<img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/memory_f_bwd_deltas.png" alt="memory_f_bwd_deltas" width="560" />
+<img src="figures/memory_f_bwd_deltas.png" alt="memory_f_bwd_deltas" width="560" />
 
 **为什么 $G$ 往往比 $R$ 小？**  
 因为两者装的不是一类东西。$R$ 里尽是又大又临时的激活（单份 $S\times S$ 就 128 MiB，FFN 中间一张 80 MiB，一层里还存多份），它们只是「算梯度时要用的草稿纸」；$G$ 的主体是参数梯度，一层参数梯度的解析下界大约只有
@@ -271,7 +271,7 @@ $$
 uv run --no-sync python scripts/plot_transformer_architecture.py
 ```
 
-<img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/memory_architecture_basics_transformer_lm.png" alt="BasicsTransformerLM architecture" width="640" />
+<img src="figures/memory_architecture_basics_transformer_lm.png" alt="BasicsTransformerLM architecture" width="640" />
 
 **数据怎么流：** Token ID 查表变成残差流向量 → 每一层先 LN 再算 Attention，加回残差流 → 再 LN 再算 SwiGLU，再加回残差流 → 如此 $L$ 次 → 最终 LN → 线性映到词表得到 logits。  
 **残差连接在图里的位置：** Attention / FFN 子层末尾的残差加法就是 $y=x+f(x)$（概念 1）；竖着贯穿各层的 $(B,S,d)$ 就是残差流（概念 2）；Attention/FFN **框内部**为反传留下的中间张量才是保存张量 $R$（概念 3）。

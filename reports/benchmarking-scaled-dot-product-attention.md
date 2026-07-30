@@ -151,7 +151,7 @@ S 较小时实测偏高（例如 S = 256 时比值 4.55），因为总占用只�
 
 ## 4. 时间结果
 
-<img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/sdpa_forward_time_vs_S.png" alt="sdpa_forward_time_vs_S.png" width="620" />
+<img src="figures/sdpa_forward_time_vs_S.png" alt="sdpa_forward_time_vs_S.png" width="620" />
 
 **前向时间。** 前向里两次矩阵乘都产生 `(B, S, S)` 规模的中间结果；前向浮点运算量主项为 `B·S²·(4d + 5)`。  
 以 d = 16 为例：S = 4096 时前向均值 6.02 ms；S = 16384 时 94.23 ms。  
@@ -159,7 +159,7 @@ S 较小时实测偏高（例如 S = 256 时比值 4.55），因为总占用只�
 长度比：16384 / 4096 = 4；理论运算量比为 4² = 16。实测 15.7 与 16 接近。  
 图上四条 d 曲线走势一致：S² 项随 S 变化，d 只作为系数 4d 进入。
 
-<img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/sdpa_backward_time_vs_S.png" alt="sdpa_backward_time_vs_S.png" width="620" />
+<img src="figures/sdpa_backward_time_vs_S.png" alt="sdpa_backward_time_vs_S.png" width="620" />
 
 **反向时间。** 反向读回 scores、weights 两张 `(B, S, S)` 并传播梯度，运算量同样含 B·S² 项。  
 仍以 d = 16、S = 16384 为例：前向 94.23 ms，反向 231.24 ms；反向除以前向：231.24 / 94.23 ≈ 2.45。  
@@ -169,7 +169,7 @@ S 较小时实测偏高（例如 S = 256 时比值 4.55），因为总占用只�
 
 ## 5. 显存结果
 
-<img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/sdpa_memory_before_backward_vs_S.png" alt="sdpa_memory_before_backward_vs_S.png" width="620" />
+<img src="figures/sdpa_memory_before_backward_vs_S.png" alt="sdpa_memory_before_backward_vs_S.png" width="620" />
 
 纵轴是 backward 开始前的 `memory_allocated`。  
 S = 16384、d = 16 时读到 16.041 GiB，与两张 S×S 矩阵的理论占用 `64·16384² / 1024³ = 16 GiB` 一致（四张 B×S×d 张量另占约 0.031 GiB）。  
@@ -179,7 +179,7 @@ S = 16384、d = 16 时读到 16.041 GiB，与两张 S×S 矩阵的理论占用 `
 
 ## 6. 网格总览与 OOM
 
-<img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/sdpa_grid_summary.png" alt="sdpa_grid_summary.png" width="700" />
+<img src="figures/sdpa_grid_summary.png" alt="sdpa_grid_summary.png" width="700" />
 
 28 个配置里，20 个跑通，8 个 OOM。OOM 全部出现在 S = 24576 或 S = 32768；S ≤ 16384 时四个 d 都能完成 100 轮前向加反向。
 

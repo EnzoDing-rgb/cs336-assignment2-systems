@@ -65,7 +65,7 @@ R 远大于 B_bd 时，**较小 k 压低激活峰**；地板不变，故 **总�
 | 16 | — | yes |
 | 32 | — | yes |
 
-<img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/gc_peak_by_segment_2048.png" alt="gc_peak_by_segment_2048" width="620" />
+<img src="figures/gc_peak_by_segment_2048.png" alt="gc_peak_by_segment_2048" width="620" />
 
 ### 4.1 none → OOM：爆在约 78 GiB
 
@@ -94,7 +94,7 @@ k=1 时任意时刻至多 **一层** block 的 R 在重算中存活（约 4 GiB 
 
 实测差 **6.0 GiB**，与「多囤一层 block 级激活」的量级一致（单层整步上下文里 R 的峰值贡献大于 4 GiB 账本，含重算瞬间的临时分配）。
 
-<img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/gc_neighborhood_best_k.png" alt="gc_neighborhood_best_k" width="520" />
+<img src="figures/gc_neighborhood_best_k.png" alt="gc_neighborhood_best_k" width="520" />
 
 **结论：** 在 2048 上 **k*=1**；k=2 是题面要求的邻域对比，用数据说明 **段越长，重算段内 k·R 越大，总峰值越高**。
 
@@ -102,7 +102,7 @@ k=1 时任意时刻至多 **一层** block 的 R 在重算中存活（约 4 GiB 
 
 k=4 时重算段临时 **4×R ≈ 16 GiB** 量级，叠地板与前向边界后再次超过 80 GiB。k 再大，k·R 更大，OOM 更早发生。
 
-<img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/gc_peak_vs_k_2048.png" alt="gc_peak_vs_k_2048" width="520" />
+<img src="figures/gc_peak_vs_k_2048.png" alt="gc_peak_vs_k_2048" width="520" />
 
 （仅含成功跑通的 k=1、k=2；其余标 OOM。）
 
@@ -122,7 +122,7 @@ k=4 时重算段临时 **4×R ≈ 16 GiB** 量级，叠地板与前向边界后�
 | 16 | 58.397 |
 | 32 | 65.537 |
 
-<img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/gc_peak_by_segment_512.png" alt="gc_peak_by_segment_512" width="620" />
+<img src="figures/gc_peak_by_segment_512.png" alt="gc_peak_by_segment_512" width="620" />
 
 ### 5.1 none 65.5 GiB vs k=1 51.7 GiB：差 13.8 GiB，仍非「腰斩」
 

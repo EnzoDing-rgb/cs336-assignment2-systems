@@ -36,7 +36,7 @@
 
 ### 1. 前向时间对比
 
-<img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/tc_attn_forward_eager_vs_compiled.png" alt="tc_attn_forward_eager_vs_compiled.png" width="640" />
+<img src="figures/tc_attn_forward_eager_vs_compiled.png" alt="tc_attn_forward_eager_vs_compiled.png" width="640" />
 
 **读图：** 实线为 eager，虚线为 compiled；纵轴为毫秒，横轴 S 对数刻度。
 
@@ -57,7 +57,7 @@ GPU kernel launch 和 Python 调度等固定开销与真实算力时间同量级
 
 ### 2. 反向时间对比
 
-<img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/tc_attn_backward_eager_vs_compiled.png" alt="tc_attn_backward_eager_vs_compiled.png" width="640" />
+<img src="figures/tc_attn_backward_eager_vs_compiled.png" alt="tc_attn_backward_eager_vs_compiled.png" width="640" />
 
 **读图：** 反向耗时整体高于前向（同配置下约 2–2.5×），compiled 虚线同样整体下移，
 但相对前向图，eager 与 compiled 的间距略窄。
@@ -72,9 +72,9 @@ backward 前显存主项约为 `8·B·S² + 16·B·S·d` 字节；S 大时 8·B�
 
 ### 3. 加速比热力图
 
-<img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/tc_attn_forward_speedup_heatmap.png" alt="tc_attn_forward_speedup_heatmap.png" width="700" />
+<img src="figures/tc_attn_forward_speedup_heatmap.png" alt="tc_attn_forward_speedup_heatmap.png" width="700" />
 
-<img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/tc_attn_backward_speedup_heatmap.png" alt="tc_attn_backward_speedup_heatmap.png" width="700" />
+<img src="figures/tc_attn_backward_speedup_heatmap.png" alt="tc_attn_backward_speedup_heatmap.png" width="700" />
 
 **前向热力图：** S ≥ 4096 后绝大多数格子在 1.5×–1.8×；d 越大、S 越大，颜色越偏绿。
 S = 256 格子的数字（约 1.2×–1.5×）反而不如 S = 16384（约 1.7×–1.8×）高——
@@ -102,7 +102,7 @@ S = 256 格子的数字（约 1.2×–1.5×）反而不如 S = 16384（约 1.7×
 
 ### 4. 代表性序列长度加速比柱图
 
-<img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/tc_attn_grouped_speedup_4096_16384.png" alt="tc_attn_grouped_speedup_4096_16384.png" width="700" />
+<img src="figures/tc_attn_grouped_speedup_4096_16384.png" alt="tc_attn_grouped_speedup_4096_16384.png" width="700" />
 
 柱高 = eager ÷ compiled；虚线 y = 1 表示「无加速」。
 不再画绝对毫秒，避免 d 和前后向量级不同导致「一眼看不出谁快多少」。
@@ -595,12 +595,12 @@ AdamW 对每个参数做：读参数、读梯度、读一阶矩、读二阶矩�
 | large | 1.12× | 1.14× | 1.00× | 28.9% | 61.9% | 9.2% |
 | xl | 1.06× | 1.07× | 1.00× | 29.1% | 60.9% | 10.0% |
 
-<img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/tc_e2e_speedup_and_share.png" alt="tc_e2e_speedup_and_share.png" width="720" />
+<img src="figures/tc_e2e_speedup_and_share.png" alt="tc_e2e_speedup_and_share.png" width="720" />
 
 左图：三步加速比随模型规模的变化。
 右图：三步时间占比——backward 六成、forward 三成、optimizer 一成，四档不变。
 
-<img src="/root/.dev/ml-sys/cs336/assignment2-systems/reports/figures/tc_e2e_segment_ms_compare.png" alt="tc_e2e_segment_ms_compare.png" width="720" />
+<img src="figures/tc_e2e_segment_ms_compare.png" alt="tc_e2e_segment_ms_compare.png" width="720" />
 
 三个子图：forward / backward / optimizer 各自的 vanilla（蓝）与 compiled（绿）绝对时间，
 柱顶数字为加速比。绿柱矮于蓝柱，差距随模型变大而绝对增大、比值变小。
