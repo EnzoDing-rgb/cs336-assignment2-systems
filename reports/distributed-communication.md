@@ -337,3 +337,66 @@ Flatten/unflatten 的 memcpy 开销和总字节数成正比，而 NaiveDDP 的 p
 - **batch size 增大不会改变通信量**，因此不能让 FlattenDDP 翻身
 
 **代码：** `cs336_systems/distributed/benchmarking/benchmark_ddp_comparison.py`
+
+---
+
+## 7. 通信与计算重叠：OverlapDDP
+
+第 6 节中 NaiveDDP 和 FlattenDDP 的 backward 和 gradient_sync 是严格串行的：backward 算完所有梯度，然后才开始 all_reduce。OverlapDDP 用 PyTorch 的 `register_post_accumulate_grad_hook` 打破了这个顺序——每算完一个参数的梯度就立刻发起异步 all_reduce，backward 继续往下算，通信在后台并行跑。
+
+### 7.1 机制
+
+```
+NaiveDDP:
+  backward (每层梯度累积) → finish_gradient_synchronization (291 次 all_reduce)
+  |──── compute ────|     |────────── communication ──────────|
+
+OverlapDDP:
+  backward (每层梯度累积 → hook 立即发起 async all_reduce)
+  |──── compute ────────────────────────|
+  |──── async all_reduce for early layers ────|  ← 通信与计算重叠
+  finish_gradient_synchronization (只等最后几个未完成的 handle)
+                                          |wait|
+```
+
+PyTorch 的 `register_post_accumulate_grad_hook` 在 autograd 引擎完成一个参数的梯度累加后立即触发。OverlapDDP 在这个 hook 里调用 `dist.all_reduce(param.grad, async_op=True)`——异步操作入队后 backward 继续往下走，GPU 的 DMA engine 一边传数据、SM 一边算下一层。
+
+`finish_gradient_synchronization` 只剩一件事：等所有 `handle.wait()` 返回。因为大部分通信已在 backward 期间完成，这段时间很短。
+
+### 7.2 结果
+
+| 分段 | NaiveDDP | OverlapDDP | Δ |
+|------|---------:|-----------:|----:|
+| forward | 0.156 s | 0.154 s | −0.002 s |
+| backward | 0.295 s | **0.531 s** | **+0.235 s** |
+| gradient_sync | 0.398 s | **0.020 s** | **−0.378 s** |
+| optimizer | 0.272 s | 0.272 s | 0.000 s |
+| **total** | **1.122 s** | **0.977 s** | **−0.145 s (−13%)** |
+
+backward 从 0.295s 涨到 0.531s——多了 0.236s。这恰好对应 NaiveDDP 中 gradient_sync 的一部分（0.398s 中约 0.236s）已经被"吞"进了 backward 里，与计算重叠执行。gradient_sync 缩到 20 ms——只剩最后一两个 handle 的收尾等待，以及 291 次 `div_(world_size)` 的耗时。
+
+净收益：每步省 **145 ms（13%）**。
+
+### 7.3 Nsight 时间线验证
+
+<img src="figures/overlap_timeline.png" alt="overlap_timeline.png" width="780" />
+
+Nsight Systems trace 的 GPU kernel 级时间线。绿色为计算 kernel（matmul、elementwise 等），红色为通信 kernel（`ncclDevKernel_AllReduce_*`）。
+
+- **NaiveDDP（上图）**：backward 期间只有绿色（纯计算），梯度同步期间密集的红色条块（291 次 all_reduce）紧跟在绿色区域之后——compute 和 comm 完全分离。
+- **OverlapDDP（下图）**：绿色和红色大面积交错——从 backward 早期就开始出现红色条块，且持续到 backward 结束。这是通信被 hook 提前发起、与后续层的计算同时进行的直接证据。
+
+### 7.4 分析
+
+OverlapDDP 比 NaiveDDP 快 13%，来源是将约 60% 的通信时间（0.398s 中的 ~0.236s）藏进了 backward 的阴影里。不能完全藏掉的原因：
+
+1. **backward 的前几层计算时还没有梯度可以传**：autograd 从最后一层倒着算，前几层的梯度要到最后才累积完，通信只能在 backward 后半段开始
+2. **最后一层的梯度最晚完成**：即使大部分通信已结束，backward 完全结束前最后那一个参数 grad 的 all_reduce 可能还在飞
+
+所以 gradient_sync 无法缩到零，但能缩到只剩"最长尾的那个 handle 的剩余时间"——实测约 20 ms。
+
+### 7.5 结论
+
+OverlapDDP 通过 `register_post_accumulate_grad_hook` + `async_op=True` 实现了 backward 计算与梯度通信的流水线重叠，在 xl 模型上每步节省 **145 ms（13%）**。代价是 backward 的墙上时间变长（因为其中包含了已在进行的通信），但总步时间显著下降。
+
+**代码：** `cs336_systems/distributed/benchmarking/benchmark_overlap_ddp.py` · **Nsight 脚本：** `cs336_systems/distributed/benchmarking/_nsys_target.py`

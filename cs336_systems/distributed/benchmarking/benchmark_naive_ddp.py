@@ -1,17 +1,19 @@
+#!/usr/bin/env python3
 # =============================================================================
 # Problem (naive_ddp_benchmarking): Naive DDP Benchmarking
 # =============================================================================
 #
-# Measures:
-#   (a) Single-GPU baseline (no DDP, pure local training)
-#   (b) 2-GPU NaiveDDP (per-parameter gradient all-reduce, ~291 calls per step)
+# Architecture:
+#   Driver mode (no --worker flag): CPU-only scheduler. Spawns a fresh
+#     subprocess for *every* configuration.  The driver never touches CUDA,
+#     so process exit is the only CUDA-cleanup mechanism we need.
 #
-# Sweeps batch sizes [4, 8, 16, 32, 64] for the xl model (Section 2.1.2).
-# Timed segments per step: forward | loss | backward | gradient_sync | optimizer.
+#   Worker mode (--worker MODE BS): Runs ONE (mode, batch_size) pair and
+#     appends results to the shared CSV. Exits immediately after —
+#     the OS reclaims all GPU memory.
 #
-# Output:
-#   artifacts/naive_ddp_benchmark.csv           — per-step segment timings
-#   artifacts/naive_ddp_per_param_latency.csv   — per-parameter all-reduce latency
+# This two-level design avoids CUDA-context / NCCL-IPC contamination between
+# single-GPU and DDP runs within the same Python process lifetime.
 # =============================================================================
 
 from __future__ import annotations
@@ -21,6 +23,8 @@ import csv
 import gc
 import os
 import statistics
+import subprocess
+import sys
 import timeit
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -49,17 +53,20 @@ VOCAB_SIZE = 10_000
 CONTEXT_LENGTH = 512
 SEED = 0
 
-# Single-GPU OOMs above batch=8 (72 GB at bs=8, >95 GB at bs=16).
-# DDP per-GPU batch = total / 2, so DDP OOMs above total=16.
-SINGLE_BATCH_LIMIT = 8
-DDP_BATCH_LIMIT = 16
+# Empirical OOM limits for xl model in fp32 + AdamW on 97 GB GPU:
+#
+#   AdamW allocates m + v (2× params = 27.2 GB) lazily during first optimizer.step().
+#   After init, persistent baseline = params(13.6) + m(13.6) + v(13.6) = 40.9 GB.
+#   Forward activations for batch=4 ≈ 29 GB, for batch=8 ≈ 57.8 GB.
+#
+#   Single-GPU: 40.9 + 29 = 70 GB ✓,  40.9 + 57.8 = 98.7 GB ✗ OOM
+#   DDP per=2:  40.9 + 14.5 = 55 GB ✓
+#   DDP per=4:  40.9 + 29 = 70 GB ✓
+#   DDP per=8:  40.9 + 57.8 = 98.7 GB ✗ OOM
+SINGLE_BATCH_LIMIT = 4
+DDP_BATCH_LIMIT = 8
 
-XL_HPARAMS = {
-    "d_model": 2560,
-    "d_ff": 10240,
-    "num_layers": 32,
-    "num_heads": 32,
-}
+XL_HPARAMS = dict(d_model=2560, d_ff=10240, num_layers=32, num_heads=32)
 
 
 # ---------------------------------------------------------------------------
@@ -80,18 +87,10 @@ class StepRecord:
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers (used only in worker processes)
 # ---------------------------------------------------------------------------
 def _sync(device: torch.device) -> None:
     if device.type == "cuda":
-        torch.cuda.synchronize(device)
-
-
-def _free_all(device: torch.device) -> None:
-    """Aggressively release GPU memory and run Python GC."""
-    gc.collect()
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
         torch.cuda.synchronize(device)
 
 
@@ -103,331 +102,270 @@ def _build_model(device: torch.device) -> BasicsTransformerLM:
     ).to(device)
 
 
-def _make_batch(
-    batch_size: int, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor]:
-    x = torch.randint(0, VOCAB_SIZE, (batch_size, CONTEXT_LENGTH), device=device)
-    y = torch.randint(0, VOCAB_SIZE, (batch_size, CONTEXT_LENGTH), device=device)
+def _make_batch(bs: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    x = torch.randint(0, VOCAB_SIZE, (bs, CONTEXT_LENGTH), device=device)
+    y = torch.randint(0, VOCAB_SIZE, (bs, CONTEXT_LENGTH), device=device)
     return x, y
 
 
-def _timed_train_step(
-    model,
-    optimizer: AdamW,
-    x: torch.Tensor,
-    y: torch.Tensor,
-    device: torch.device,
-    *,
-    do_gradient_sync: bool = False,
-) -> dict[str, float]:
+def _timed_train_step(model, optimizer, x, y, device, *, do_gradient_sync=False):
     optimizer.zero_grad(set_to_none=True)
 
-    _sync(device)
-    t0 = timeit.default_timer()
+    _sync(device); t0 = timeit.default_timer()
     logits = model(x)
-    _sync(device)
-    forward_s = timeit.default_timer() - t0
+    _sync(device); fwd = timeit.default_timer() - t0
 
-    _sync(device)
-    t0 = timeit.default_timer()
+    _sync(device); t0 = timeit.default_timer()
     loss = cross_entropy(logits, y)
-    _sync(device)
-    loss_s = timeit.default_timer() - t0
+    _sync(device); loss_s = timeit.default_timer() - t0
 
-    _sync(device)
-    t0 = timeit.default_timer()
+    _sync(device); t0 = timeit.default_timer()
     loss.backward()
-    _sync(device)
-    backward_s = timeit.default_timer() - t0
+    _sync(device); bwd = timeit.default_timer() - t0
 
     if do_gradient_sync:
-        _sync(device)
-        t0 = timeit.default_timer()
+        _sync(device); t0 = timeit.default_timer()
         model.finish_gradient_synchronization()
-        _sync(device)
-        gradient_sync_s = timeit.default_timer() - t0
+        _sync(device); sync_s = timeit.default_timer() - t0
     else:
-        gradient_sync_s = 0.0
+        sync_s = 0.0
 
-    _sync(device)
-    t0 = timeit.default_timer()
+    _sync(device); t0 = timeit.default_timer()
     optimizer.step()
-    _sync(device)
-    optimizer_s = timeit.default_timer() - t0
+    _sync(device); opt_s = timeit.default_timer() - t0
 
-    # Help Python reclaim activation memory from this step.
     del logits, loss
-    return {
-        "forward": forward_s,
-        "loss": loss_s,
-        "backward": backward_s,
-        "gradient_sync": gradient_sync_s,
-        "optimizer": optimizer_s,
-    }
+    return {"forward": fwd, "loss": loss_s, "backward": bwd,
+            "gradient_sync": sync_s, "optimizer": opt_s}
 
 
-def _measure_per_param_all_reduce(
-    model: NaiveDDP,
-    x: torch.Tensor,
-    y: torch.Tensor,
-    optimizer: AdamW,
-    device: torch.device,
-) -> list[tuple[str, int, float]]:
+# ---------------------------------------------------------------------------
+# Per-parameter all_reduce recording (NaiveDDP only)
+# ---------------------------------------------------------------------------
+def _record_per_param(ddp_model, x, y, optimizer, device, csv_path):
     optimizer.zero_grad(set_to_none=True)
-    logits = model(x)
-    loss = cross_entropy(logits, y)
+    _ = ddp_model(x)
+    loss = cross_entropy(_, y)
     loss.backward()
-    del logits, loss
+    del _, loss
 
-    inner = model.module
+    inner = ddp_model.module
     world_size = dist.get_world_size()
-    results: list[tuple[str, int, float]] = []
+    results = []
 
     _sync(device)
     for p_name, param in inner.named_parameters():
         if param.grad is None:
             continue
-        _sync(device)
-        t0 = timeit.default_timer()
+        _sync(device); t0 = timeit.default_timer()
         dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
-        _sync(device)
-        dt = timeit.default_timer() - t0
+        _sync(device); dt = timeit.default_timer() - t0
         param.grad.div_(world_size)
         results.append((p_name, param.numel(), dt))
 
     optimizer.step()
-    return results
+
+    Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(csv_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["param_name", "numel", "bytes", "latency_s"])
+        for name, n, lat in results:
+            w.writerow([name, n, n * 4, lat])
+    print(f"  per-param data saved ({len(results)} tensors)")
 
 
 # ---------------------------------------------------------------------------
-# Single-GPU benchmark (runs in-process with cleanup)
+# Worker: single-GPU run (ONE batch size, exits after writing CSV)
 # ---------------------------------------------------------------------------
-def run_single_gpu(batch_size: int, output_csv: Path) -> list[StepRecord]:
+def _worker_single(batch_size: int, output_csv: str) -> None:
     device = torch.device("cuda:0")
     torch.cuda.set_device(0)
     torch.manual_seed(SEED)
     torch.cuda.manual_seed_all(SEED)
 
-    print(f"\n── Single-GPU · batch={batch_size} ──", flush=True)
-
     model = _build_model(device)
     model.train()
     optimizer = AdamW(model.parameters())
     x, y = _make_batch(batch_size, device)
-    records: list[StepRecord] = []
+    records = []
 
-    try:
-        # Warmup
-        for i in range(WARMUP_STEPS):
-            _timed_train_step(model, optimizer, x, y, device, do_gradient_sync=False)
-            print(f"  warmup {i + 1}/{WARMUP_STEPS}")
+    for i in range(WARMUP_STEPS):
+        _timed_train_step(model, optimizer, x, y, device, do_gradient_sync=False)
 
-        # Measurement
-        for i in range(MEASURE_STEPS):
-            segs = _timed_train_step(model, optimizer, x, y, device, do_gradient_sync=False)
-            total = sum(segs.values())
-            rec = StepRecord(
-                mode="single", batch_size=batch_size, step=i, rank=0,
-                forward_s=segs["forward"], loss_s=segs["loss"],
-                backward_s=segs["backward"], gradient_sync_s=0.0,
-                optimizer_s=segs["optimizer"], total_s=total,
-            )
-            records.append(rec)
-            print(
-                f"  step {i + 1:>2}/{MEASURE_STEPS}  "
-                f"fwd={segs['forward']:.3f}s  loss={segs['loss']:.3f}s  "
-                f"bwd={segs['backward']:.3f}s  opt={segs['optimizer']:.3f}s  "
-                f"sum={total:.3f}s"
-            )
+    for i in range(MEASURE_STEPS):
+        segs = _timed_train_step(model, optimizer, x, y, device, do_gradient_sync=False)
+        total = sum(segs.values())
+        records.append(StepRecord(
+            mode="single", batch_size=batch_size, step=i, rank=0,
+            forward_s=segs["forward"], loss_s=segs["loss"],
+            backward_s=segs["backward"], gradient_sync_s=0.0,
+            optimizer_s=segs["optimizer"], total_s=total,
+        ))
+        print(f"  step {i + 1:>2}/{MEASURE_STEPS}  fwd={segs['forward']:.3f}s  "
+              f"loss={segs['loss']:.3f}s  bwd={segs['backward']:.3f}s  "
+              f"opt={segs['optimizer']:.3f}s  sum={total:.3f}s")
 
-        _append_csv(output_csv, records)
-    finally:
-        del optimizer, x, y
-        del model
-        _free_all(device)
-
-    return records
+    _append_csv(Path(output_csv), records)
+    _print_summary(records)
 
 
 # ---------------------------------------------------------------------------
-# DDP worker + launcher
+# Worker: DDP run (ONE batch size, uses mp.spawn internally)
 # ---------------------------------------------------------------------------
-def _ddp_worker(
-    rank: int,
-    world_size: int,
-    batch_size: int,
-    master_port: str,
-    output_csv: str,
-    per_param_csv: str | None,
-) -> None:
+def _ddp_worker(rank, world_size, batch_size, master_port, output_csv, per_param_csv):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = master_port
-
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
-
     torch.manual_seed(SEED)
     torch.cuda.manual_seed_all(SEED)
 
     try:
-        model = _build_model(device)
-        model.train()
+        model = _build_model(device); model.train()
         ddp_model = NaiveDDP(model)
         optimizer = AdamW(ddp_model.parameters())
         per_rank_batch = batch_size // world_size
         x, y = _make_batch(per_rank_batch, device)
-        local_records: list[StepRecord] = []
+        local_records = []
 
-        # Warmup
-        for i in range(WARMUP_STEPS):
+        for _ in range(WARMUP_STEPS):
             _timed_train_step(ddp_model, optimizer, x, y, device, do_gradient_sync=True)
-            if rank == 0:
-                print(f"  warmup {i + 1}/{WARMUP_STEPS}")
 
-        # Measurement
         for i in range(MEASURE_STEPS):
             segs = _timed_train_step(ddp_model, optimizer, x, y, device, do_gradient_sync=True)
             total = sum(segs.values())
-            rec = StepRecord(
+            local_records.append(StepRecord(
                 mode="naive_ddp", batch_size=batch_size, step=i, rank=rank,
                 forward_s=segs["forward"], loss_s=segs["loss"],
                 backward_s=segs["backward"],
                 gradient_sync_s=segs["gradient_sync"],
                 optimizer_s=segs["optimizer"], total_s=total,
-            )
-            local_records.append(rec)
+            ))
             if rank == 0:
-                print(
-                    f"  step {i + 1:>2}/{MEASURE_STEPS}  "
-                    f"fwd={segs['forward']:.3f}s  loss={segs['loss']:.3f}s  "
-                    f"bwd={segs['backward']:.3f}s  sync={segs['gradient_sync']:.3f}s  "
-                    f"opt={segs['optimizer']:.3f}s  sum={total:.3f}s"
-                )
+                print(f"  step {i + 1:>2}/{MEASURE_STEPS}  fwd={segs['forward']:.3f}s  "
+                      f"loss={segs['loss']:.3f}s  bwd={segs['backward']:.3f}s  "
+                      f"sync={segs['gradient_sync']:.3f}s  opt={segs['optimizer']:.3f}s  "
+                      f"sum={total:.3f}s")
 
-        # Per-parameter timing (separate step, rank 0 only)
         if per_param_csv is not None and rank == 0:
-            print("  recording per-parameter all_reduce latencies …")
-            pp_data = _measure_per_param_all_reduce(ddp_model, x, y, optimizer, device)
-            pp_path = Path(per_param_csv)
-            pp_path.parent.mkdir(parents=True, exist_ok=True)
-            with pp_path.open("w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(["param_name", "numel", "bytes", "latency_s"])
-                for p_name, numel, lat in pp_data:
-                    writer.writerow([p_name, numel, numel * 4, lat])
-            print(f"  per-param data saved ({len(pp_data)} tensors)")
+            print("  recording per-parameter all-reduce latencies …")
+            _record_per_param(ddp_model, x, y, optimizer, device, per_param_csv)
         elif per_param_csv is not None:
             _timed_train_step(ddp_model, optimizer, x, y, device, do_gradient_sync=True)
 
-        # Gather records across ranks
-        gathered: list[list[StepRecord] | None] = [None for _ in range(world_size)]
+        gathered = [None for _ in range(world_size)]
         dist.all_gather_object(gathered, local_records)
-
         if rank == 0:
-            all_records: list[StepRecord] = []
-            for rrecs in gathered:
-                if rrecs is not None:
-                    all_records.extend(rrecs)
-            _append_csv(Path(output_csv), all_records)
-
+            all_recs = [r for rlist in gathered if rlist is not None for r in rlist]
+            _append_csv(Path(output_csv), all_recs)
     finally:
-        dist.barrier()
-        dist.destroy_process_group()
-        del optimizer, ddp_model, model, x, y
-        _free_all(device)
+        dist.barrier(); dist.destroy_process_group()
 
 
-def run_ddp(
-    batch_size: int,
-    output_csv: Path,
-    master_port: int,
-    *,
-    record_per_param: bool = False,
-) -> list[StepRecord]:
-    world_size = 2
-    per_rank = batch_size // world_size
-    print(f"\n── NaiveDDP 2-GPU · total_batch={batch_size} (per_rank={per_rank}) · port={master_port} ──", flush=True)
-
-    pp_csv = str(PER_PARAM_CSV) if record_per_param else None
-
-    mp.spawn(
-        fn=_ddp_worker,
-        args=(world_size, batch_size, str(master_port), str(output_csv), pp_csv),
-        nprocs=world_size,
-        join=True,
-    )
-
-    # Parent-process cleanup after DDP spawn
-    _free_all(torch.device("cuda:0"))
-
-    return _load_records(output_csv, mode="naive_ddp", batch_size=batch_size)
+def _worker_ddp(batch_size: int, output_csv: str, master_port: int,
+                per_param_csv: str | None) -> None:
+    mp.spawn(_ddp_worker,
+             args=(2, batch_size, str(master_port), output_csv, per_param_csv),
+             nprocs=2, join=True)
+    recs = _load_records(Path(output_csv), mode="naive_ddp", batch_size=batch_size)
+    _print_summary(recs)
 
 
 # ---------------------------------------------------------------------------
-# CSV I/O
+# CSV helpers
 # ---------------------------------------------------------------------------
 def _append_csv(path: Path, records: list[StepRecord]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     write_header = not path.exists() or path.stat().st_size == 0
-    fieldnames = list(asdict(records[0]).keys())
     with path.open("a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if write_header:
-            writer.writeheader()
-        for r in records:
-            writer.writerow(asdict(r))
+        w = csv.DictWriter(f, fieldnames=list(asdict(records[0]).keys()))
+        if write_header: w.writeheader()
+        for r in records: w.writerow(asdict(r))
 
 
-def _load_records(
-    path: Path, *, mode: str | None = None, batch_size: int | None = None
-) -> list[StepRecord]:
-    records: list[StepRecord] = []
+def _load_records(path, *, mode=None, batch_size=None):
+    recs = []
+    if not path.exists(): return recs
     with path.open("r") as f:
         for row in csv.DictReader(f):
-            if mode and row["mode"] != mode:
-                continue
-            if batch_size and int(row["batch_size"]) != batch_size:
-                continue
-            records.append(StepRecord(
-                mode=row["mode"],
-                batch_size=int(row["batch_size"]),
-                step=int(row["step"]),
-                rank=int(row["rank"]),
-                forward_s=float(row["forward_s"]),
-                loss_s=float(row["loss_s"]),
+            if mode and row["mode"] != mode: continue
+            if batch_size and int(row["batch_size"]) != batch_size: continue
+            recs.append(StepRecord(
+                mode=row["mode"], batch_size=int(row["batch_size"]),
+                step=int(row["step"]), rank=int(row["rank"]),
+                forward_s=float(row["forward_s"]), loss_s=float(row["loss_s"]),
                 backward_s=float(row["backward_s"]),
                 gradient_sync_s=float(row["gradient_sync_s"]),
                 optimizer_s=float(row["optimizer_s"]),
-                total_s=float(row["total_s"]),
-            ))
-    return records
+                total_s=float(row["total_s"])))
+    return recs
 
 
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
-def print_summary(records: list[StepRecord]) -> None:
-    if not records:
-        return
-    mode = records[0].mode
-    bs = records[0].batch_size
-    keys = ["forward_s", "loss_s", "backward_s", "gradient_sync_s", "optimizer_s", "total_s"]
-    labels = ["forward", "loss", "backward", "grad_sync", "optimizer", "TOTAL"]
-    print(f"\n  Summary [{mode}] batch={bs} ({len(records)} steps from all ranks):")
-    for key, label in zip(keys, labels):
+def _print_summary(records):
+    if not records: return
+    m, bs = records[0].mode, records[0].batch_size
+    print(f"\n  Summary [{m}] batch={bs} ({len(records)} steps):")
+    for key, label in [("forward_s","forward"), ("loss_s","loss"),
+                        ("backward_s","backward"), ("gradient_sync_s","grad_sync"),
+                        ("optimizer_s","optimizer"), ("total_s","TOTAL")]:
         vals = [getattr(r, key) for r in records]
-        mean = statistics.mean(vals)
-        std = statistics.stdev(vals) if len(vals) > 1 else 0.0
-        if label == "grad_sync" and mean == 0.0:
-            continue
-        total_mean = statistics.mean([r.total_s for r in records])
-        pct = (mean / total_mean * 100) if total_mean > 0 else 0.0
-        print(f"    {label:>12}: {mean:.4f}s ± {std:.4f}s  ({pct:.1f}%)")
+        mu = statistics.mean(vals)
+        sd = statistics.stdev(vals) if len(vals) > 1 else 0.0
+        if label == "grad_sync" and mu == 0.0: continue
+        tot = statistics.mean([r.total_s for r in records])
+        pct = (mu / tot * 100) if tot > 0 else 0.0
+        print(f"    {label:>12}: {mu:.4f}s ± {sd:.4f}s  ({pct:.1f}%)")
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Driver: CPU-only, launches subprocess for each config
+# ---------------------------------------------------------------------------
+def _driver(args: argparse.Namespace) -> None:
+    output_csv = Path(args.output)
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    if output_csv.exists(): output_csv.unlink()
+    if PER_PARAM_CSV.exists(): PER_PARAM_CSV.unlink()
+
+    # Prevent CUDA memory fragmentation from causing spurious OOMs on
+    # models with heterogeneous tensor sizes (291 nn.Parameter tensors
+    # ranging from 10 KB to 105 MB).
+    env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
+
+    python = sys.executable
+    script = __file__
+
+    for i, bs in enumerate(args.batch_sizes):
+        port = args.master_port + i
+
+        # --- Single-GPU ---
+        if not args.skip_single and bs <= SINGLE_BATCH_LIMIT:
+            print(f"\n── Single-GPU · batch={bs} ──", flush=True)
+            subprocess.run(
+                [python, script,
+                 "--worker", "single", str(bs),
+                 "--output", str(output_csv)],
+                check=True, env=env,
+            )
+
+        # --- DDP ---
+        if not args.skip_ddp and bs <= DDP_BATCH_LIMIT:
+            print(f"\n── NaiveDDP 2-GPU · batch={bs} ──", flush=True)
+            cmd = [python, script,
+                   "--worker", "ddp", str(bs),
+                   "--output", str(output_csv),
+                   "--master-port", str(port)]
+            if not args.no_per_param and i == 0:
+                cmd += ["--per-param-csv", str(PER_PARAM_CSV)]
+            subprocess.run(cmd, check=True, env=env)
+
+    print(f"\n✓ All results → {output_csv}")
+    if PER_PARAM_CSV.exists():
+        print(f"✓ Per-param latencies → {PER_PARAM_CSV}")
+
+
+# ---------------------------------------------------------------------------
+# CLI
 # ---------------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Naive DDP Benchmark — CS336 Assignment 2")
@@ -439,45 +377,30 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-single", action="store_true")
     p.add_argument("--skip-ddp", action="store_true")
     p.add_argument("--no-per-param", action="store_true")
+    # Worker mode
+    p.add_argument("--worker", nargs=2, metavar=("MODE", "BS"),
+                   help="Internal: run single config and exit. MODE ∈ {single, ddp}")
+    p.add_argument("--per-param-csv", default=None,
+                   help="Internal: path for per-param CSV (ddp worker only)")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
 
-    output_csv = Path(args.output)
-    output_csv.parent.mkdir(parents=True, exist_ok=True)
-    if output_csv.exists():
-        output_csv.unlink()
-    if PER_PARAM_CSV.exists():
-        PER_PARAM_CSV.unlink()
-
-    for i, bs in enumerate(args.batch_sizes):
-        port = args.master_port + i
-
-        # ---- Single-GPU baseline ----
-        if not args.skip_single:
-            if bs > SINGLE_BATCH_LIMIT:
-                print(f"\n── Single-GPU · batch={bs} ── SKIPPED (> {SINGLE_BATCH_LIMIT}, expected OOM)", flush=True)
-            else:
-                records = run_single_gpu(bs, output_csv)
-                print_summary(records)
-
-        # ---- 2-GPU NaiveDDP ----
-        if not args.skip_ddp:
-            if bs > DDP_BATCH_LIMIT:
-                print(f"\n── NaiveDDP 2-GPU · batch={bs} ── SKIPPED (> {DDP_BATCH_LIMIT}, expected OOM)", flush=True)
-            else:
-                do_pp = (not args.no_per_param) and (i == 0)
-                records = run_ddp(
-                    bs, output_csv, master_port=port,
-                    record_per_param=do_pp,
-                )
-                print_summary(records)
-
-    print(f"\n✓ All results → {output_csv}")
-    if PER_PARAM_CSV.exists():
-        print(f"✓ Per-param latencies → {PER_PARAM_CSV}")
+    if args.worker is not None:
+        # ── Worker process (touches CUDA) ──
+        mode, bs_str = args.worker
+        bs = int(bs_str)
+        if mode == "single":
+            _worker_single(bs, args.output)
+        elif mode == "ddp":
+            _worker_ddp(bs, args.output, args.master_port, args.per_param_csv)
+        else:
+            raise ValueError(f"Unknown worker mode: {mode}")
+    else:
+        # ── Driver process (CPU only) ──
+        _driver(args)
 
 
 if __name__ == "__main__":
