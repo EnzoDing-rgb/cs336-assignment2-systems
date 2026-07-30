@@ -255,6 +255,8 @@ GPU kernel 启动这步是各 GPU 并行完成的，不互相等待，因此不�
 
 ### 6.3 结果
 
+<img src="figures/ddp_gradient_sync_comparison.png" alt="DDP gradient sync comparison" width="780" />
+
 | 分段 | NaiveDDP（291 次 all_reduce） | FlattenDDP（1 次 all_reduce） | 差值 |
 |------|------------------------------:|-------------------------------:|-----:|
 | forward | 0.156 s (13.9%) | 0.155 s (13.4%) | −0.001 s |
