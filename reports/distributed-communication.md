@@ -377,14 +377,14 @@ backward 从 0.295s 涨到 0.531s——多了 0.236s。这恰好对应 NaiveDDP 
 
 净收益：每步省 **145 ms（13%）**。
 
-### 7.3 Nsight 时间线验证
+### 7.3 时间线验证
 
-<img src="figures/overlap_timeline.png" alt="overlap_timeline.png" width="780" />
+<img src="figures/overlap_timeline.png" alt="NaiveDDP vs OverlapDDP backward communication overlap timeline" width="780" />
 
-Nsight Systems trace 的 GPU kernel 级时间线。绿色为计算 kernel（matmul、elementwise 等），红色为通信 kernel（`ncclDevKernel_AllReduce_*`）。
+下图把 Nsight Systems trace 观察到的 kernel 行为整理成时间线示意。绿色表示 backward 计算窗口，红色表示梯度 `all_reduce` 通信，浅红斜线表示已经被 backward 计算遮住的通信时间。
 
-- **NaiveDDP（上图）**：backward 期间只有绿色（纯计算），梯度同步期间密集的红色条块（291 次 all_reduce）紧跟在绿色区域之后——compute 和 comm 完全分离。
-- **OverlapDDP（下图）**：绿色和红色大面积交错——从 backward 早期就开始出现红色条块，且持续到 backward 结束。这是通信被 hook 提前发起、与后续层的计算同时进行的直接证据。
+- **NaiveDDP**：backward 结束后才进入 gradient sync，0.398s 的通信完整暴露在训练 step 里。
+- **OverlapDDP**：hook 在 backward 中途提前发起 async `all_reduce`，大部分通信被后续 backward 计算遮住，最后只剩约 20 ms 的 exposed wait。
 
 ### 7.4 分析
 
@@ -400,3 +400,60 @@ OverlapDDP 比 NaiveDDP 快 13%，来源是将约 60% 的通信时间（0.398s �
 OverlapDDP 通过 `register_post_accumulate_grad_hook` + `async_op=True` 实现了 backward 计算与梯度通信的流水线重叠，在 xl 模型上每步节省 **145 ms（13%）**。代价是 backward 的墙上时间变长（因为其中包含了已在进行的通信），但总步时间显著下降。
 
 **代码：** `cs336_systems/distributed/benchmarking/benchmark_overlap_ddp.py` · **Nsight 脚本：** `cs336_systems/distributed/benchmarking/_nsys_target.py`
+
+---
+
+## 8. Optimizer State Sharding：显存与速度的权衡
+
+AdamW 为每个参数维护两份缓存——一阶矩 `m` 和二阶矩 `v`——各和参数本身一样大。不做 sharding 时，每张 GPU 存着完全相同的 m 和 v，xl 模型 ~3.41B 参数意味着每卡 27.3 GB 的冗余。
+
+本节对比基线（普通 AdamW，每卡全量 m+v）与 ShardedOptimizer（m+v 按参数轮询分片到 2 张 GPU，每卡只存一半的 optimizer state）。
+
+### 8.1 显存账本
+
+| 组件 | 每卡大小 | 说明 |
+|------|---------|------|
+| 模型参数 | 13.6 GB | FP32，全部 GPU 各持一份（前向/反向需要） |
+| 梯度 | 13.6 GB | DDP all_reduce 后每卡都有完整梯度 |
+| Adam m | 13.6 GB | 不做 sharding 时每卡全量；sharding 后减半 |
+| Adam v | 13.6 GB | 同上 |
+| 中间激活 | ~11 GB | 前向/反向临时张量，x 轴与 optimizer 无关 |
+| **总计（无 sharding）** | **~52 GB** | |
+| **总计（2-way sharding）** | **~39 GB** | m+v 减半，省 ~13.6 GB |
+
+### 8.2 实测
+
+<img src="figures/sharded_optimizer_comparison.png" alt="sharded_optimizer_comparison.png" width="720" style="margin: 12px 0;" />
+
+| 指标 | AdamW (baseline) | ShardedOptimizer | Δ |
+|------|-----------------:|-----------------:|----:|
+| peak memory (before opt) | 52.1 GiB | **39.4 GiB** | **−12.7 GiB (−24%)** |
+| optimizer step time | 274 ms | 463 ms | +189 ms (+69%) |
+| total step time | 1.126 s | 1.313 s | +0.187 s (+17%) |
+
+### 8.3 分析
+
+**显存。** ShardedOptimizer 省了 ~12.7 GiB，与理论值 13.6 GiB（Adam m+v 的一半）吻合。差值是 PyTorch 分配器和中间激活的固定开销，占比很小。在 80 GB 卡上意义不大（52 GB 和 39 GB 都装得下），但到了多卡大模型场景——例如单卡只有 24 GB 显存、模型就要 30 GB——这 13 GB 就是能不能跑的区别。
+
+**速度。** Optimizer step 从 274 ms 涨到 463 ms，慢了 69%。根因是 `ShardedOptimizer.step()` 末尾要对每个参数做一次 broadcast：
+
+```python
+for p, owner in self._param_owners:          # 291 次
+    dist.broadcast(p.data, src=owner)        #   rank 0 广播 P0, rank 1 广播 P1, …
+```
+
+291 次 broadcast 每次都要一次独立的通信调用。和我们在 §4 里测到的一样：小张量 broadcast 被固定开销主导——RMSNorm 的 10 KB 权重和 embedding 的 100 MB 权重，broadcast 调用本身的 kernel launch + NCCL 协议开销是近似的。291 次调用累积出 ~189 ms 的额外延迟。
+
+**权衡。** 用 ~17% 的训练步时间换 24% 的显存。在显存充裕时这是亏的（我们的 80 GB 卡上 baseline 52 GB 完全够），但在显存紧缺时（需要更大 batch、更长上下文、或更小的卡）这就是必须付的代价。
+
+### 8.4 与 ZeRO Stage 1 的比较
+
+ZeRO Stage 1（Pos）和我们的 ShardedOptimizer 都做 optimizer state 分片——这是核心相同点。m 和 v 不再每卡全量存储，只存在 owner rank 上。
+
+关键差异有两处：
+
+1. **梯度释放。** ZeRO-1 在 all_reduce 完梯度后，每个 rank 立即释放不属于自己分片的梯度——因为那些梯度只对别的 rank 的 optimizer step 有用。我们的实现不释放梯度（DDP 已经 all_reduce 完了就留在那）。因此 ZeRO-1 的显存峰值更低一些——梯度的冗余存储也被消除了。
+
+2. **权重同步方式。** 我们每步用逐个参数的 broadcast 把更新后的权重同步到所有卡。ZeRO-1 标准做法是用一次 `all_gather`（或 reduce-scatter 的逆操作）批量化完成——这避免了 291 次独立调用带来的固定开销。这也是我们 optimizer step 慢 69% 的根因：用 broadcast 而非 all_gather。
+
+**代码：** `cs336_systems/distributed/benchmarking/benchmark_sharded_optimizer.py`
