@@ -1,0 +1,617 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>一图讲清：All-Reduce / Reduce-Scatter / All-Gather → TP · CP · PP</title>
+<style>
+  :root {
+    --bg: #f7f8fb;
+    --ink: #111827;
+    --muted: #6b7280;
+    --line: #d1d5db;
+    --card: #ffffff;
+    --blue0: #93c5fd; --blue1: #60a5fa; --blue2: #3b82f6; --blue3: #1d4ed8; --blueSum: #1e3a8a;
+    --pink0: #f9a8d4; --pink1: #f472b6; --pink2: #db2777; --pink3: #9d174d;
+    --lav0: #ddd6fe; --lav1: #c4b5fd; --lav2: #a78bfa; --lav3: #7c3aed;
+    --empty: #f3f4f6;
+    --ok: #065f46; --okbg: #ecfdf5;
+    --warn: #92400e; --warnbg: #fffbeb;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "SF Pro Text", "Segoe UI", "PingFang SC", "Noto Sans SC", sans-serif;
+    color: var(--ink);
+    background: var(--bg);
+    line-height: 1.55;
+    font-size: 15px;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 18px 80px; }
+  h1 { font-size: 1.55rem; margin: 0 0 8px; letter-spacing: -0.02em; }
+  h2 {
+    font-size: 1.25rem;
+    margin: 42px 0 10px;
+    padding-top: 18px;
+    border-top: 1px solid var(--line);
+  }
+  h3 { font-size: 1.02rem; margin: 18px 0 8px; }
+  .lede { color: var(--muted); max-width: 52em; margin: 0 0 18px; }
+  .eq {
+    display: inline-block;
+    background: #111827;
+    color: #fff;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.95rem;
+    padding: 10px 14px;
+    border-radius: 10px;
+    margin: 8px 0 20px;
+  }
+  .callout {
+    background: var(--okbg);
+    border-left: 4px solid var(--ok);
+    padding: 10px 14px;
+    margin: 12px 0 18px;
+    max-width: 52em;
+  }
+  .warn {
+    background: var(--warnbg);
+    border-left: 4px solid var(--warn);
+    padding: 10px 14px;
+    margin: 12px 0 18px;
+    max-width: 52em;
+  }
+  .triptych {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 14px;
+    margin: 16px 0 10px;
+  }
+  @media (max-width: 980px) {
+    .triptych { grid-template-columns: 1fr; }
+  }
+  .panel {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 14px 12px 16px;
+  }
+  .panel h3 {
+    text-align: center;
+    margin: 0 0 12px;
+    font-size: 1.05rem;
+  }
+  .stage-label {
+    text-align: center;
+    font-size: 0.78rem;
+    color: var(--muted);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    margin: 6px 0 8px;
+  }
+  .arrow-down {
+    text-align: center;
+    font-size: 1.4rem;
+    color: #374151;
+    margin: 6px 0;
+    font-weight: 700;
+  }
+  .gpus {
+    display: flex;
+    justify-content: center;
+    gap: 8px;
+  }
+  .gpu {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    align-items: center;
+  }
+  .gpu-tag {
+    font-size: 0.7rem;
+    color: var(--muted);
+    margin-bottom: 2px;
+  }
+  .cell {
+    width: 78px;
+    min-height: 34px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.68rem;
+    font-weight: 600;
+    color: #111;
+    padding: 4px 3px;
+    line-height: 1.15;
+    border: 1px solid rgba(0,0,0,0.06);
+  }
+  .cell.empty {
+    background: var(--empty);
+    border: 1px dashed #c7cad1;
+    color: transparent;
+    min-height: 34px;
+  }
+  .cell.tall { min-height: 56px; width: 88px; font-size: 0.72rem; }
+  .cell.sm { width: 64px; min-height: 28px; font-size: 0.62rem; }
+  .b0 { background: var(--blue0); } .b1 { background: var(--blue1); color:#fff; }
+  .b2 { background: var(--blue2); color:#fff; } .b3 { background: var(--blue3); color:#fff; }
+  .bsum { background: var(--blueSum); color:#fff; }
+  .p0 { background: var(--pink0); } .p1 { background: var(--pink1); color:#fff; }
+  .p2 { background: var(--pink2); color:#fff; } .p3 { background: var(--pink3); color:#fff; }
+  .l0 { background: var(--lav0); } .l1 { background: var(--lav1); }
+  .l2 { background: var(--lav2); color:#fff; } .l3 { background: var(--lav3); color:#fff; }
+  .caption {
+    margin-top: 12px;
+    font-size: 0.88rem;
+    color: #374151;
+    text-align: center;
+    max-width: 28em;
+    margin-left: auto;
+    margin-right: auto;
+  }
+  .caption strong { color: var(--ink); }
+  table.compare {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--card);
+    margin: 14px 0 8px;
+    font-size: 0.9rem;
+  }
+  table.compare th, table.compare td {
+    border: 1px solid var(--line);
+    padding: 9px 10px;
+    text-align: left;
+    vertical-align: top;
+  }
+  table.compare th { background: #eef2ff; }
+  .story {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 16px 16px 18px;
+    margin: 14px 0;
+  }
+  .flow {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr auto 1fr;
+    gap: 8px;
+    align-items: center;
+    margin: 12px 0;
+  }
+  @media (max-width: 900px) {
+    .flow { grid-template-columns: 1fr; }
+    .flow .chev { transform: rotate(90deg); text-align: center; }
+  }
+  .flow .chev {
+    font-size: 1.5rem;
+    color: #4b5563;
+    font-weight: 700;
+    text-align: center;
+  }
+  .mini-title {
+    font-size: 0.75rem;
+    color: var(--muted);
+    text-align: center;
+    margin-bottom: 6px;
+  }
+  .pp-row {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin: 14px 0;
+  }
+  .stage-box {
+    background: #e0e7ff;
+    border: 2px solid #4338ca;
+    border-radius: 12px;
+    padding: 14px 16px;
+    min-width: 120px;
+    text-align: center;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.82rem;
+    font-weight: 600;
+  }
+  .p2p {
+    font-size: 0.85rem;
+    color: #b45309;
+    font-weight: 700;
+    white-space: nowrap;
+  }
+  .key {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: #f3f4f6;
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-size: 0.9em;
+  }
+  ul.tight { margin: 6px 0 0 1.2em; padding: 0; }
+  ul.tight li { margin: 4px 0; }
+  .footer-note { color: var(--muted); font-size: 0.85rem; margin-top: 28px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>一图讲清：集合通信 → TP · CP · PP</h1>
+  <p class="lede">
+    先把右边这三种「卡和卡之间交换数据」的动作看懂（它们就是那张经典示意图）。
+    然后再看三种并行：它们切的轴不同，因此<strong>需要的集合通信也不同</strong>。
+    本页全是静态图，按从上到下读即可。
+  </p>
+
+  <div class="eq">All-Reduce&nbsp;=&nbsp;Reduce-Scatter&nbsp;+&nbsp;All-Gather</div>
+
+  <!-- ========== 三种原语 ========== -->
+  <h2>0. 三种集合通信（先对齐这张图）</h2>
+  <p class="lede">四列 = 四张 GPU（A/B/C/D）。每张图都是：<strong>通信前 → 操作 → 通信后</strong>。</p>
+
+  <div class="triptych">
+    <!-- All-Reduce -->
+    <div class="panel">
+      <h3>① All-Reduce</h3>
+      <div class="stage-label">通信前：每卡一份完整局部张量</div>
+      <div class="gpus">
+        <div class="gpu"><div class="gpu-tag">GPU A</div><div class="cell tall b0">A</div></div>
+        <div class="gpu"><div class="gpu-tag">GPU B</div><div class="cell tall b1">B</div></div>
+        <div class="gpu"><div class="gpu-tag">GPU C</div><div class="cell tall b2">C</div></div>
+        <div class="gpu"><div class="gpu-tag">GPU D</div><div class="cell tall b3">D</div></div>
+      </div>
+      <div class="arrow-down">↓ All-Reduce（求和 + 广播）</div>
+      <div class="stage-label">通信后：每卡都有完整总和</div>
+      <div class="gpus">
+        <div class="gpu"><div class="cell tall bsum">A+B+C+D</div></div>
+        <div class="gpu"><div class="cell tall bsum">A+B+C+D</div></div>
+        <div class="gpu"><div class="cell tall bsum">A+B+C+D</div></div>
+        <div class="gpu"><div class="cell tall bsum">A+B+C+D</div></div>
+      </div>
+      <p class="caption"><strong>求和 + 人人都拿完整结果。</strong>没有人缺一块。</p>
+    </div>
+
+    <!-- Reduce-Scatter -->
+    <div class="panel">
+      <h3>② Reduce-Scatter</h3>
+      <div class="stage-label">通信前：每卡都有 4 段</div>
+      <div class="gpus">
+        <div class="gpu">
+          <div class="gpu-tag">GPU A</div>
+          <div class="cell sm p0">A0</div><div class="cell sm p1">A1</div>
+          <div class="cell sm p2">A2</div><div class="cell sm p3">A3</div>
+        </div>
+        <div class="gpu">
+          <div class="gpu-tag">GPU B</div>
+          <div class="cell sm p0">B0</div><div class="cell sm p1">B1</div>
+          <div class="cell sm p2">B2</div><div class="cell sm p3">B3</div>
+        </div>
+        <div class="gpu">
+          <div class="gpu-tag">GPU C</div>
+          <div class="cell sm p0">C0</div><div class="cell sm p1">C1</div>
+          <div class="cell sm p2">C2</div><div class="cell sm p3">C3</div>
+        </div>
+        <div class="gpu">
+          <div class="gpu-tag">GPU D</div>
+          <div class="cell sm p0">D0</div><div class="cell sm p1">D1</div>
+          <div class="cell sm p2">D2</div><div class="cell sm p3">D3</div>
+        </div>
+      </div>
+      <div class="arrow-down">↓ Reduce-Scatter（同下标求和 → 各拿一段）</div>
+      <div class="stage-label">通信后：每卡只拿「自己那段」的总和</div>
+      <div class="gpus">
+        <div class="gpu">
+          <div class="cell sm p3">A0+…+D0</div>
+          <div class="cell sm empty">·</div><div class="cell sm empty">·</div><div class="cell sm empty">·</div>
+        </div>
+        <div class="gpu">
+          <div class="cell sm empty">·</div>
+          <div class="cell sm p3">A1+…+D1</div>
+          <div class="cell sm empty">·</div><div class="cell sm empty">·</div>
+        </div>
+        <div class="gpu">
+          <div class="cell sm empty">·</div><div class="cell sm empty">·</div>
+          <div class="cell sm p3">A2+…+D2</div>
+          <div class="cell sm empty">·</div>
+        </div>
+        <div class="gpu">
+          <div class="cell sm empty">·</div><div class="cell sm empty">·</div><div class="cell sm empty">·</div>
+          <div class="cell sm p3">A3+…+D3</div>
+        </div>
+      </div>
+      <p class="caption"><strong>求和，但每人只拿其中一段。</strong>没有人持有完整总和。</p>
+    </div>
+
+    <!-- All-Gather -->
+    <div class="panel">
+      <h3>③ All-Gather</h3>
+      <div class="stage-label">通信前：每卡只有自己那一段</div>
+      <div class="gpus">
+        <div class="gpu">
+          <div class="gpu-tag">GPU A</div>
+          <div class="cell sm l0">A</div>
+          <div class="cell sm empty">·</div><div class="cell sm empty">·</div><div class="cell sm empty">·</div>
+        </div>
+        <div class="gpu">
+          <div class="gpu-tag">GPU B</div>
+          <div class="cell sm empty">·</div>
+          <div class="cell sm l1">B</div>
+          <div class="cell sm empty">·</div><div class="cell sm empty">·</div>
+        </div>
+        <div class="gpu">
+          <div class="gpu-tag">GPU C</div>
+          <div class="cell sm empty">·</div><div class="cell sm empty">·</div>
+          <div class="cell sm l2">C</div>
+          <div class="cell sm empty">·</div>
+        </div>
+        <div class="gpu">
+          <div class="gpu-tag">GPU D</div>
+          <div class="cell sm empty">·</div><div class="cell sm empty">·</div><div class="cell sm empty">·</div>
+          <div class="cell sm l3">D</div>
+        </div>
+      </div>
+      <div class="arrow-down">↓ All-Gather（只拷贝拼接，不求和）</div>
+      <div class="stage-label">通信后：每卡都有完整拼接结果</div>
+      <div class="gpus">
+        <div class="gpu">
+          <div class="cell sm l0">A</div><div class="cell sm l1">B</div>
+          <div class="cell sm l2">C</div><div class="cell sm l3">D</div>
+        </div>
+        <div class="gpu">
+          <div class="cell sm l0">A</div><div class="cell sm l1">B</div>
+          <div class="cell sm l2">C</div><div class="cell sm l3">D</div>
+        </div>
+        <div class="gpu">
+          <div class="cell sm l0">A</div><div class="cell sm l1">B</div>
+          <div class="cell sm l2">C</div><div class="cell sm l3">D</div>
+        </div>
+        <div class="gpu">
+          <div class="cell sm l0">A</div><div class="cell sm l1">B</div>
+          <div class="cell sm l2">C</div><div class="cell sm l3">D</div>
+        </div>
+      </div>
+      <p class="caption"><strong>不求和，只拼接。</strong>人人最终都拿到同一份完整张量。</p>
+    </div>
+  </div>
+
+  <div class="callout">
+    把中间图的「每人一段总和」再做一次右边的 All-Gather，就会变成左边 All-Reduce 的结果：
+    每人手里是「完整总和」。所以才有公式：
+    <span class="key">All-Reduce = Reduce-Scatter + All-Gather</span>。
+  </div>
+
+  <table class="compare">
+    <tr><th>原语</th><th>有没有求和</th><th>通信结束后每张卡手里是什么</th></tr>
+    <tr><td>All-Reduce</td><td>有</td><td>完整总和（人人相同）</td></tr>
+    <tr><td>Reduce-Scatter</td><td>有</td><td>总和的<strong>一块分片</strong>（人人不同）</td></tr>
+    <tr><td>All-Gather</td><td>没有</td><td>完整拼接张量（人人相同）</td></tr>
+  </table>
+
+  <!-- ========== TP ========== -->
+  <h2>1. TP（Tensor Parallel）——切「同一个 token 的特征宽度」</h2>
+
+  <div class="warn">
+    <strong>切哪根轴：</strong>同一个样本、同一个 token，它的特征向量沿 <span class="key">d_model</span>（或 FFN 的宽）切开，
+    多张卡各算一块，再合成完整结果。<br/>
+    <strong>对照：</strong>不是把不同 token 分给不同卡（那是 CP）；也不是把不同层分给不同卡（那是 PP）。
+  </div>
+
+  <div class="story">
+    <h3>场景（4 卡 TP，以「行并行 matmul → 需要求和」为例）</h3>
+    <p>
+      目标算 <span class="key">Y = X · W</span>。把 <span class="key">W</span> 按行切开成
+      <span class="key">W<sub>A</sub>, W<sub>B</sub>, W<sub>C</sub>, W<sub>D</sub></span>，
+      每张卡同时把输入的对应切片乘自己的权重块，得到局部贡献：
+    </p>
+
+    <div class="stage-label" style="margin-top:14px">本地算完之后 = 上图 All-Reduce 的「通信前」</div>
+    <div class="gpus" style="margin-bottom:8px">
+      <div class="gpu"><div class="gpu-tag">GPU A</div><div class="cell tall b0">Y<sub>A</sub> = X<sub>A</sub>W<sub>A</sub></div></div>
+      <div class="gpu"><div class="gpu-tag">GPU B</div><div class="cell tall b1">Y<sub>B</sub> = X<sub>B</sub>W<sub>B</sub></div></div>
+      <div class="gpu"><div class="gpu-tag">GPU C</div><div class="cell tall b2">Y<sub>C</sub> = X<sub>C</sub>W<sub>C</sub></div></div>
+      <div class="gpu"><div class="gpu-tag">GPU D</div><div class="cell tall b3">Y<sub>D</sub> = X<sub>D</sub>W<sub>D</sub></div></div>
+    </div>
+
+    <p>
+      完整输出是<strong>四块贡献之和</strong>：
+      <span class="key">Y = Y<sub>A</sub> + Y<sub>B</sub> + Y<sub>C</sub> + Y<sub>D</sub></span>。
+      下一层还要在每张卡上继续用完整的 <span class="key">Y</span>，所以必须让<strong>每张卡都拿到完整 Y</strong>。
+    </p>
+
+    <div class="arrow-down">↓ 标准 TP 做法：一次 All-Reduce</div>
+
+    <div class="gpus">
+      <div class="gpu"><div class="gpu-tag">GPU A</div><div class="cell tall bsum">Y = Σ Y<sub>i</sub></div></div>
+      <div class="gpu"><div class="gpu-tag">GPU B</div><div class="cell tall bsum">Y = Σ Y<sub>i</sub></div></div>
+      <div class="gpu"><div class="gpu-tag">GPU C</div><div class="cell tall bsum">Y = Σ Y<sub>i</sub></div></div>
+      <div class="gpu"><div class="gpu-tag">GPU D</div><div class="cell tall bsum">Y = Σ Y<sub>i</sub></div></div>
+    </div>
+
+    <div class="callout" style="margin-top:16px">
+      <strong>为什么是 All-Reduce，不是 All-Gather？</strong><br/>
+      因为四张卡算出来的是「同一形状张量上的<strong>加法贡献</strong>」，不是「可以拼起来的不同列」。
+      加法 → 需要 <strong>Reduce</strong>；人人都要完整结果 → 需要 All-Reduce。
+    </div>
+
+    <h3>变体：先 Reduce-Scatter，再用 All-Gather（等价于 All-Reduce）</h3>
+    <div class="flow">
+      <div class="panel" style="padding:10px">
+        <div class="mini-title">① Reduce-Scatter</div>
+        <div class="gpus">
+          <div class="gpu"><div class="cell sm p3">Y 段0</div></div>
+          <div class="gpu"><div class="cell sm p3">Y 段1</div></div>
+          <div class="gpu"><div class="cell sm p3">Y 段2</div></div>
+          <div class="gpu"><div class="cell sm p3">Y 段3</div></div>
+        </div>
+        <p class="caption" style="font-size:0.8rem">每人只拿总和的一段</p>
+      </div>
+      <div class="chev">→</div>
+      <div class="panel" style="padding:10px; background:#fffbeb">
+        <div class="mini-title">②（可选）本地算只依赖本段的东西</div>
+        <p class="caption" style="font-size:0.8rem; margin:0">通信与计算重叠的空间</p>
+      </div>
+      <div class="chev">→</div>
+      <div class="panel" style="padding:10px">
+        <div class="mini-title">③ All-Gather</div>
+        <div class="gpus">
+          <div class="gpu">
+            <div class="cell sm l0">0</div><div class="cell sm l1">1</div>
+            <div class="cell sm l2">2</div><div class="cell sm l3">3</div>
+          </div>
+        </div>
+        <p class="caption" style="font-size:0.8rem">拼回完整 Y（人人都有）</p>
+      </div>
+    </div>
+    <p>
+      这不是另一种数学结果，而是把一次 All-Reduce <strong>拆成两步</strong>，好在中间塞计算。
+      最终仍然等价于「每人一份完整 Y」。
+    </p>
+  </div>
+
+  <!-- ========== CP ========== -->
+  <h2>2. CP（Context / Sequence Parallel）——切「不同 token 的序列位置」</h2>
+
+  <div class="warn">
+    <strong>切哪根轴：</strong>沿 <span class="key">seq_len</span> 切开。每个 token 的特征向量<strong>完整</strong>留在一张卡上；
+    不同卡负责序列上不同的 token 段。<br/>
+    <strong>和 TP 的一句话差别：</strong>TP 是「同一个 token 被拆开」；CP 是「不同 token 住在不同卡」。
+  </div>
+
+  <div class="story">
+    <h3>例子：4 卡，总序列长度 8</h3>
+    <div class="gpus" style="margin:10px 0 16px">
+      <div class="gpu"><div class="gpu-tag">GPU A</div><div class="cell tall l0">token 0–1<br/>完整向量</div></div>
+      <div class="gpu"><div class="gpu-tag">GPU B</div><div class="cell tall l1">token 2–3<br/>完整向量</div></div>
+      <div class="gpu"><div class="gpu-tag">GPU C</div><div class="cell tall l2">token 4–5<br/>完整向量</div></div>
+      <div class="gpu"><div class="gpu-tag">GPU D</div><div class="cell tall l3">token 6–7<br/>完整向量</div></div>
+    </div>
+
+    <h3>阶段 1：算 Attention 前 —— 需要 All-Gather（拿全局 K/V）</h3>
+    <p>
+      Attention 规则：每个 query token 要和<strong>序列里所有</strong> key 做点积。
+      但 GPU A 本地只有 token 0–1 的 K，看不到 2–7。所以必须先把各卡的 K（以及 V）拼齐。
+    </p>
+
+    <div class="stage-label">通信前 = 上图 All-Gather 的「通信前」</div>
+    <div class="gpus">
+      <div class="gpu"><div class="gpu-tag">GPU A</div><div class="cell tall l0">K<sub>A</sub></div></div>
+      <div class="gpu"><div class="gpu-tag">GPU B</div><div class="cell tall l1">K<sub>B</sub></div></div>
+      <div class="gpu"><div class="gpu-tag">GPU C</div><div class="cell tall l2">K<sub>C</sub></div></div>
+      <div class="gpu"><div class="gpu-tag">GPU D</div><div class="cell tall l3">K<sub>D</sub></div></div>
+    </div>
+    <div class="arrow-down">↓ All-Gather（拼接，不求和）</div>
+    <div class="gpus">
+      <div class="gpu"><div class="gpu-tag">每张卡</div><div class="cell tall bsum" style="width:200px">K_full = concat(K<sub>A</sub>,K<sub>B</sub>,K<sub>C</sub>,K<sub>D</sub>)</div></div>
+    </div>
+    <p>
+      V 同理。之后：GPU A 用自己的 Q（token 0–1）× 全局 K/V，算出自己那段输出
+      <span class="key">O<sub>A</sub></span>；其他卡同理。
+    </p>
+
+    <div class="callout">
+      <strong>为什么这里是 All-Gather，不是 All-Reduce？</strong><br/>
+      因为各卡手里是「序列上<strong>不同位置</strong>的 K」，要拼成一条长序列，不是对同一位置做加法。
+      拼接 → All-Gather。
+    </div>
+
+    <h3>阶段 2：继续以分片形式往下走 —— 常用 Reduce-Scatter</h3>
+    <p>
+      后面若某层又产生了「每张卡都有一份对完整输出的贡献、但下一层只想按序列分片持有」，
+      就会用 Reduce-Scatter：先按位置求和，再让每张卡只留下自己负责的那一段序列。
+    </p>
+    <div class="gpus">
+      <div class="gpu"><div class="gpu-tag">GPU A</div><div class="cell tall p3">O 的 seq 段 0<br/>（总和后留下）</div></div>
+      <div class="gpu"><div class="gpu-tag">GPU B</div><div class="cell tall p3">O 的 seq 段 1</div></div>
+      <div class="gpu"><div class="gpu-tag">GPU C</div><div class="cell tall p3">O 的 seq 段 2</div></div>
+      <div class="gpu"><div class="gpu-tag">GPU D</div><div class="cell tall p3">O 的 seq 段 3</div></div>
+    </div>
+    <p>
+      这样 CP 可以一直维持「每卡只存自己那截序列」，显存按序列长度摊薄。
+      若某处必须完整 O，再 All-Gather 一次即可。
+    </p>
+  </div>
+
+  <!-- ========== PP ========== -->
+  <h2>3. PP（Pipeline Parallel）——切「层的深度」</h2>
+
+  <div class="warn">
+    <strong>切哪根轴：</strong>沿模型深度切开。GPU A 跑层 0–7，GPU B 跑层 8–15……<br/>
+    <strong>关键：</strong>PP <strong>不用</strong> All-Reduce / Reduce-Scatter / All-Gather 这类「全体集合通信」。
+    它只用相邻 stage 之间的 <strong>P2P send / recv</strong>。
+  </div>
+
+  <div class="story">
+    <h3>4 卡 Pipeline 长什么样</h3>
+    <div class="pp-row">
+      <div class="stage-box">GPU A<br/>层 0–7</div>
+      <div class="p2p">── send 激活 ──▶</div>
+      <div class="stage-box">GPU B<br/>层 8–15</div>
+      <div class="p2p">── send 激活 ──▶</div>
+      <div class="stage-box">GPU C<br/>层 16–23</div>
+      <div class="p2p">── send 激活 ──▶</div>
+      <div class="stage-box">GPU D<br/>层 24–31</div>
+    </div>
+    <p>
+      前向：A 算完自己的层，把<strong>边界激活</strong>发给 B；B 算完再发给 C……<br/>
+      反向：梯度沿相反方向，D → C → B → A，同样是相邻点对点。
+    </p>
+    <div class="callout">
+      <strong>为什么这里没有那三种集合原语？</strong><br/>
+      因为任意时刻，数据只需要从「上一截层」流到「下一截层」。
+      不存在「四张卡同时对同一张量求和」或「四张卡互相拼齐同一份 K」这种全体协作。
+      通信拓扑是一条<strong>链</strong>，不是一个<strong>环上的全体集合</strong>。
+    </div>
+  </div>
+
+  <!-- ========== 总表 ========== -->
+  <h2>4. 一图对照：TP / CP / PP</h2>
+  <table class="compare">
+    <tr>
+      <th></th>
+      <th>切什么</th>
+      <th>一张卡上，一个 token 的向量？</th>
+      <th>典型通信</th>
+      <th>为什么是这种通信</th>
+    </tr>
+    <tr>
+      <td><strong>TP</strong></td>
+      <td>特征宽 / 矩阵宽（同一 token 被切开）</td>
+      <td>被拆开，分住在多卡</td>
+      <td><strong>All-Reduce</strong>（或 RS+AG）</td>
+      <td>各卡算出的是<strong>加法贡献</strong>，且人人要完整结果</td>
+    </tr>
+    <tr>
+      <td><strong>CP</strong></td>
+      <td>序列位置（不同 token 分到不同卡）</td>
+      <td>完整，但只覆盖自己那段序列</td>
+      <td><strong>All-Gather</strong>（拿全局 K/V）+ 常配 <strong>Reduce-Scatter</strong></td>
+      <td>Attention 要看全局上下文 → 先拼；之后常继续按序列分片持有</td>
+    </tr>
+    <tr>
+      <td><strong>PP</strong></td>
+      <td>层深度（不同层住在不同卡）</td>
+      <td>完整（在当前 stage 的层里）</td>
+      <td><strong>P2P send/recv</strong>，不用三种集合原语</td>
+      <td>数据只需沿层链前后传，不需要全体卡对同一张量规约/拼接</td>
+    </tr>
+  </table>
+
+  <div class="callout">
+    <strong>记法口诀：</strong>
+    <ul class="tight">
+      <li><strong>求和且人人要完整</strong> → All-Reduce（TP 最常见）</li>
+      <li><strong>只拼接、不求和</strong> → All-Gather（CP 拉齐 K/V）</li>
+      <li><strong>求和但每人只要一段</strong> → Reduce-Scatter</li>
+      <li><strong>只跟邻居传激活</strong> → P2P（PP）</li>
+    </ul>
+  </div>
+
+  <p class="footer-note">
+    原图备份：<span class="key">misc/figures/all-reduce-rs-ag.png</span>。
+    本页文件：<span class="key">misc/misc-tp-cp-pp-collectives.html</span>。
+  </p>
+
+</div>
+</body>
+</html>
