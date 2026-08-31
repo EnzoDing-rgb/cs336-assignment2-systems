@@ -92,8 +92,9 @@ x ──► W1,W2 列切 ──► x1,x2 ──► f·⊙ ──► z ──► 
          本地                 本地                 本地                    ↑ 集合通信
 ```
 
-Attention 子层同样：**QKV 列切**，**输出投影行切**，子层出口 **all-reduce** 完整 hidden state。  
-一个 Transformer block 内 **多次** all-reduce；粗算通信系数约 **8×**（4 次 all-reduce × 环形算法因子 2）。
+Attention 子层：**QKV 列切** → 本地 attention → **输出投影行切** → **all-reduce ①**。  
+FFN 子层：**$W_1,W_2$ 列切** → 门控 → **$W_3$ 行切** → **all-reduce ②**。  
+**推理前向：每层 2 次 all-reduce**（Attention 1 次 + FFN 1 次）。§6.2.1 展开 block 级数字。
 
 ### 3.2 All-Reduce 是什么
 
@@ -210,30 +211,50 @@ Decode 生产路径：
 
 #### 6.2.1 Block 里 TP 切在哪、all-reduce 在哪
 
+Megatron 规矩：**列切入口、行切出口**；每个子层 **出口 1 次** all-reduce。
+
 ```text
                     ┌── Attention ─────────────────────────────────────┐
-  hidden x          │  QKV 列切 → 本地 attention → 输出投影 行切       │
-  (B,S,D)           │                              ↓                   │
+  hidden x          │  QKV 列切 → 本地 attention（按头/列块）          │
+  (B,S,D)           │  输出投影 行切 → partial                         │
+                    │                              ↓                   │
                     │                    all-reduce ①  → 完整 attn 输出 │
                     └── FFN ─────────────────────────────────────────┘
-                        W1,W2 列切 → 门控 → W3 行切
+                        W1,W2 列切 → 门控（本地）→ W3 行切 → partial
                                               ↓
                                     all-reduce ②  → 完整 block 输出
 ```
 
-讲义量级：一个 block 前向 **4 次** 激活 all-reduce（Attention 里 2 次 + FFN 里 2 次，或等价地合并计数）。下面用 **系数 4** 统一写：
+**为啥各 1 次，合计 2 次？**
+
+| 子层 | 列切（本地 matmul） | 行切（partial sum） | all-reduce |
+|------|---------------------|---------------------|------------|
+| Attention | QKV 投影 | 输出投影 | **①** 出口 1 次 |
+| FFN | $W_1,W_2$ 升维 | $W_3$ 降维 | **②** 出口 1 次 |
+
+列切段 **宽维已对齐**，中间 **省掉 all-gather**；行切产生 partial，**每个子层出口 all-reduce 1 次**。FFN 的 $W_1,W_2,W_3$ **共用 1 次** 出口规约（列切 + 行切配对，见 §3）。
+
+**讲义里的「4」与「8」（训练全步，对比用）：**
+
+```text
+推理前向 / 层：  Attention 出口 1 次 + FFN 出口 1 次  =  2 次 all-reduce
+训练再 + 反向：  Attention 入口 1 次 + FFN 入口 1 次  =  再 2 次（规约 dX）
+训练全步 / 层：  合计 4 次 all-reduce
+环形 NCCL：      每次 all-reduce ≈ 2 段（reduce-scatter + all-gather）
+讲义系数 8：     4 次 × 2 段 = 8  （乘在 bsh 上的那个 8，指训练全步，指 8 张卡）
+```
+
+**下文推理数字一律用前向 2 次 / 层：**
 
 $$
 \boxed{
-\text{每层 TP 通信字节（FP16 消息本体）}
-= 4 \times 2 \cdot B \cdot S \cdot D
-= 8\,B S D \ \text{字节}.
+\text{推理前向，每层 TP 通信（FP16 消息本体）}
+= 2 \times 2 \cdot B \cdot S \cdot D
+= 4\,B S D \ \text{字节}.
 }
 $$
 
-环形 NCCL 再乘系数 $\dfrac{2(N_{\mathrm{TP}}-1)}{N_{\mathrm{TP}}}$；$N_{\mathrm{TP}}=2$ 时 $\approx 1$，下面 **先比 Prefill / Decode / Batch**，取 $N_{\mathrm{TP}}=2$。
-
-**每次 all-reduce 传的是激活** $(B, S, D)$，**传权重** 发生在 CP / EP，属于别的并行轴。
+每次 all-reduce 传激活 $(B,S,D)$。环形系数 $\dfrac{2(N_{\mathrm{TP}}-1)}{N_{\mathrm{TP}}}$；$N_{\mathrm{TP}}=2$ 时 $\approx 1$。
 
 #### 6.2.2 每层算力（每 TP 卡）
 
@@ -269,13 +290,13 @@ $$
 **一层通信：**
 
 $$
-8 \cdot 1 \cdot 2048 \cdot 4096 = 67\ \text{MB}.
+4 \cdot 1 \cdot 2048 \cdot 4096 = 33.5\ \text{MB} \approx 34\ \text{MB}.
 $$
 
 **整模 Prefill 通信（32 层）：**
 
 $$
-32 \times 67\ \text{MB} \approx 2.1\ \text{GB}\ \text{（一次 prefill pass）}.
+32 \times 34\ \text{MB} \approx 1.1\ \text{GB}\ \text{（一次 prefill pass）}.
 $$
 
 **一层算力（每卡，加总 Attn + FFN）：**
@@ -299,22 +320,22 @@ FFN:      6·B·S·D·D_FF/N_TP
 | 项 | 估算 |
 |----|------|
 | 计算 | $18\ \text{TFLOP} / 150\ \text{TFLOP/s} \approx 120\ \text{ms}$ |
-| 通信（若串行暴露） | $2.1\ \text{GB} / 100\ \text{GB/s} \approx 21\ \text{ms}$ |
+| 通信（若串行暴露） | $1.1\ \text{GB} / 100\ \text{GB/s} \approx 11\ \text{ms}$ |
 
 Prefill：**大 matmul 与大 all-reduce 同 pass**；算力与带宽 **同一量级**，Tensor Core 容易 **吃满**。
 
 #### Decode：$B=1$，$S=1$，$S_{\mathrm{ctx}}=2048$（每步 1 token）
 
-**一层通信：**
+**一层通信（2 次 all-reduce，合计）：**
 
 $$
-8 \cdot 1 \cdot 1 \cdot 4096 = 32\ \text{KB}.
+4 \cdot 1 \cdot 1 \cdot 4096 = 16\ \text{KB}.
 $$
 
-**每步生成 1 token（32 层）：**
+**每步生成 1 token（32 层 × 2 次/层）：**
 
 $$
-32 \times 32\ \text{KB} = 1\ \text{MB / step}.
+32 \times 16\ \text{KB} = 512\ \text{KB / step};\qquad \text{collective 次数} = 2 \times 32 = 64\ \text{次/step}.
 $$
 
 **一层算力（每卡）：**
@@ -335,10 +356,10 @@ FFN:      6·B·D·D_FF/N_TP
 
 | 腿 | $B=1$ 时发生什么 |
 |----|------------------|
-| **带宽** | 1 MB/step ÷ 100 GB/s ≈ **0.01 ms**（纯传字节极快） |
-| **延迟** | 每层 **4 次** collective × 32 层 = **128 次** / step；每次有固定 launch + 同步开销（常 **10–50 μs** 量级）→ 光延迟即可 **1–6 ms**，与 **277 MFLOP × 32** 的窄 matmul **同阶甚至更大** |
+| **带宽** | 512 KB/step ÷ 100 GB/s ≈ **0.005 ms**（纯传字节极快） |
+| **延迟** | **64 次** collective / step（每层 Attention 1 次 + FFN 1 次）；每次 launch + 同步常 **10–50 μs** → 光延迟 **0.6–3 ms**，与整步 **≈9 GFLOP** 的窄 matmul **同阶** |
 
-Decode 的 TP 画像：**消息轻（32 KB/次），次数极多（128 次/step）**；瓶颈从 **带宽** 转向 **延迟 + 碎 matmul 利用率**。
+Decode 的 TP 画像：**单次消息 16 KB（每层合计）**，**64 次/step**；瓶颈在 **延迟栈 + 窄 matmul**，带宽仍富余。
 
 ---
 
@@ -348,12 +369,12 @@ Decode 的 TP 画像：**消息轻（32 KB/次），次数极多（128 次/step�
 
 #### 通信：随 $B$ **线性放大**
 
-| $B$ | 单层通信 $8BSD$ | 每 step 全模型 $L \times 8BSD$ |
-|-----|-----------------|--------------------------------|
-| 1 | 32 KB | 1 MB |
-| 32 | **1 MB** | **32 MB** |
+| $B$ | 单层通信 $4BSD$ | 每 step 全模型 | collective 次数 |
+|-----|-----------------|----------------|-----------------|
+| 1 | 16 KB | 512 KB | 64 |
+| 32 | **512 KB** | **16 MB** | 64（相同） |
 
-collective **次数** 仍是 128 / step；**每次消息** 变宽 32 倍 → 链路从 **「延迟主导」** 移向 **「带宽主导」**，字节传输 **更划算**。
+collective **次数** 仍是 **64 / step**；**每次消息** 随 $B$ 线性变宽 → 链路从 **延迟主导** 移向 **带宽主导**。
 
 #### 算力：也随 $B$ **线性放大**
 
@@ -367,24 +388,22 @@ FFN matmul 形状从 $(1, D) \times (D, D_{\mathrm{FF}})$ 变为 $(32, D) \times
 #### 为什么加大 $B$ 让算力吃得更满？（三句话）
 
 ```text
-① 固定开销摊薄：128 次 collective / step 的次数不变；B 变大 → 每次多传 32 行激活，
-   同一次 launch 搬更多有用字节。
+① 固定开销摊薄：64 次 collective / step 的次数不变；B 变大 → 每次 all-reduce 多传 B 行激活。
 
-② matmul 变「胖」：Decode FFN 的 m 维从 1 → B；GPU 擅长大矩阵，B=1 时 SM 大量空转。
+② matmul 变「胖」：Decode FFN 的 m 维从 1 → B；Tensor Core 吃 $(B,D)$ 比 $(1,D)$ 满。
 
-③ 吞吐换延迟：单用户仍等 1 token；服务多用户时 B=32 一次 step 出 32 token，
-   tokens/s ≈ 单请求 × B（理想情况）。
+③ 吞吐换延迟：continuous batching 下一次 step 服务 B 个请求，tokens/s 随 B 近线性涨。
 ```
 
 **对比表（Decode，$S_{\mathrm{ctx}}=2048$）：**
 
 | | $B=1$ | $B=32$ |
 |--|-------|--------|
-| 单次 all-reduce 消息 | 32 KB | 1 MB |
-| 每 step collective 次数 | 128 | 128（相同） |
+| 单层通信（2 次 AR 合计） | 16 KB | 512 KB |
+| 每 step collective 次数 | **64** | **64** |
 | 每 step 算力 | ≈ 9 GFLOP | ≈ 285 GFLOP |
-| 典型瓶颈 | **延迟 + 窄 matmul** | **带宽 + 算力**（更接近 Prefill 的平衡） |
-| continuous batching 的作用 | 基准 | **把 Decode 往 Prefill 的「大块计算」形态拉** |
+| 典型瓶颈 | **延迟 + 窄 matmul** | **带宽 + 算力** |
+| continuous batching | 基准 | matmul 与 all-reduce **同 Prefill 一样变胖** |
 
 ---
 
@@ -393,8 +412,8 @@ FFN matmul 形状从 $(1, D) \times (D, D_{\mathrm{FF}})$ 变为 $(32, D) \times
 | 维度 | Prefill | Decode（$B=1$） | Decode（$B=32$，continuous batching） |
 |------|---------|-----------------|----------------------------------------|
 | all-reduce 形状 | $(B, S, D)$，$S$ 大 | $(B, 1, D)$ | $(32, 1, D)$ |
-| 单层通信 $8BSD$ | 67 MB（$S{=}2048$） | 32 KB | 1 MB |
-| 调用频率 | 每层 × **1 次 prefill** | 每层 × **每个 token** | 同左，消息宽 32× |
+| 单层通信 $4BSD$ | 34 MB（$S{=}2048$） | 16 KB | 512 KB |
+| all-reduce 次数 / token | $2L$（每层 2 次） | $2L=64$ | 同左，消息 ×32 |
 | 单层算力 | ≈ 567 GFLOP/层 | ≈ 277 MFLOP/层 | ≈ 8.9 GFLOP/层（整步 ≈ 285 GFLOP） |
 | 瓶颈 | 带宽 + 算力 | **延迟栈** | 带宽 + 算力（改善） |
 | 加 TP 的边际收益 | **高**（权重分摊 + 大 matmul） | **低**（消息轻、次数多） | **回升**（$B$ 撑宽消息与 matmul） |
@@ -426,7 +445,7 @@ Decode 墙钟 ≈ Σ_{每 token} [ 读 KV（∝ S） + 窄 matmul + 多次小 al
 |------|------------|-----------|
 | 算力 | $S$ 大，Attention $\mathcal{O}(S^2)$ **主导** | FFN 窄 matmul；Attention **读** $S_{\mathrm{ctx}}$ cache |
 | 激活 / KV 显存 | 一次存整段 prompt | cache 随 $S_{\mathrm{ctx}}$ 线性涨 → **CP** |
-| TP all-reduce | $8BSD$，$S$ 在形状里 **大** | $8BD$（$S{=}1$）**小**；次数 = $4L$ / token |
+| TP all-reduce | $4BSD$，$S$ 大 | $4BD$（$S{=}1$）；**$2L$ 次/token** |
 | EP all-to-all | 一次 $B\!\cdot\!S$ tokens **burst** | 每 token 一次，逐步累加 |
 | continuous batching | 天然大 $B$、大 $S$ | **抬高 $B$** → 消息与 matmul 同 Prefill 一样变「胖」 |
 
@@ -439,51 +458,145 @@ Decode 墙钟 ≈ Σ_{每 token} [ 读 KV（∝ S） + 窄 matmul + 多次小 al
 
 ---
 
-## 8. 训练 vs 推理：TP overlap 对照（拓展）
+## 8. 推理 vs 训练：TP 能不能 overlap？
 
-推理路径 **包含前向**。训练路径 **额外包含反向**；反向里有一处经典 overlap 窗口，帮助理解「什么能并行」：
+**结论先放前面：**
 
-**Megatron FFN 反向（训练）：**
+| 路径 | 每层 all-reduce 次数 | 层内 overlap 窗口 | 主要 overlap 来源 |
+|------|----------------------|-------------------|-------------------|
+| **推理 Prefill 前向** | **2**（Attn + FFN 出口） | 窄：大 matmul 与 AR 仍 **串行依赖** | 多请求 batch、双流 async |
+| **推理 Decode 前向** | **2L / token**（64 次/step，$L{=}32$） | 极窄：matmul 块小 | **continuous batching** 撑大 $B$ |
+| **训练 前向** | **2**（同推理） | 同推理 Prefill | 同左 |
+| **训练 反向** | **再 +2**（Attn + FFN **入口**规约 $dx$） | **宽：$dx$ async + 同层 $dW$ 并行** | Megatron 调度 |
+
+---
+
+### 8.1 推理：同一 token、同一层上，matmul 与 all-reduce **串行**
+
+行切 matmul 产出 partial → **必须 all-reduce** → 下一子层才用 **完整** 激活。时间线（单层 Attention 或 FFN 出口）：
+
+```text
+SM:     [── 行切 matmul（partial）──][ wait ][ 下一子层 matmul ]
+链路:                              [ all-reduce ]
+```
+
+**async collective 能做什么：** 发起 all-reduce 后 SM 可去算 **别的请求 / 别的层 / 别的 stream 上无依赖的 kernel**；**本 token 本层** 的下一 matmul 仍要在 `wait()` 之后。
+
+---
+
+### 8.2 推理 Prefill：overlap 空间
+
+| 因素 | 说明 |
+|------|------|
+| **消息大小** | 每次 AR 传 $(B,S,D)$，$S$ 大 → 单次 **16 MB 量级/层**（2 次合计 34 MB） |
+| **算力** | 单层 **≈567 GFLOP** → matmul 耗时长 |
+| **overlap** | 大 matmul 期间 **async 发起** AR，或 **compute stream / comm stream** 并行；**层间 wait** 仍在 |
+| **对比 Decode** | Prefill 的 AR **/message** 大，带宽利用率高；Decode 的 AR **/message** 小，**次数** 同为 2/层/token |
+
+Prefill 墙钟近似：
+
+$$
+T_{\mathrm{prefill}} \approx \sum_{\mathrm{layers}}\bigl(T_{\mathrm{matmul}} + T_{\mathrm{AR}}\bigr)\ \text{（层间串行）}
+$$
+
+大 $T_{\mathrm{matmul}}$ 让 $T_{\mathrm{AR}}$ 相对 **易被盖住一部分**（双 stream 下取 $\max$ 的项变少）。
+
+---
+
+### 8.3 推理 Decode：overlap 空间
+
+| 因素 | $B=1$ | $B=32$（continuous batching） |
+|------|-------|--------------------------------|
+| 每层 AR 合计 | 16 KB | 512 KB |
+| 每 step 次数 | **64** | **64** |
+| 每 step 算力 | ≈ 9 GFLOP | ≈ 285 GFLOP |
+| 瓶颈 | **64 次 launch 延迟** | 带宽 + 算力（改善） |
+
+Decode 的 TP overlap **主要靠抬高 $B$**：次数 **64 不变**，单次消息与 matmul **同乘 $B$**——与 Prefill 同构的「胖消息 + 胖 matmul」。
+
+**推理侧 overlap 三板斧（对比训练）：**
+
+```text
+① continuous batching     → 同一 step 多请求，B>1
+② 调度器填缝              → prefill batch 与 decode batch 交替占 SM
+③ comm / compute 双流     → async AR 与无依赖 kernel 并行
+```
+
+训练独有的 **$dx$ async + $dW$ 并行**（§8.4），推理 **用不上**——推理路径 **只有前向**。
+
+---
+
+### 8.4 训练：反向多出的 overlap 窗口
+
+训练全步每层 **4 次** all-reduce：前向 2 次（Attn/FFN 出口）+ 反向 2 次（Attn/FFN 入口，规约 $dx$）。
+
+**FFN 反向（Megatron）：**
 
 ```text
 ① dW3, dz, dx2, dx1        ← 本地
 ② dx_local = dx1·W1ᵀ + dx2·W2ᵀ
-③ all-reduce(dx_local) → dx
-④ dW1, dW2                  ← 只依赖 x, dx1, dx2
+③ all-reduce(dx_local) → dx   ← 要传给更前面的层
+④ dW1, dW2                  ← 只依赖 x, dx1, dx2；与 ③ 结果无关
 ```
 
-| 顺序 | 行为 |
-|------|------|
+| 调度 | 时间线 |
+|------|--------|
 | **串行** | ① → ② → ③ wait → ④ |
-| **重叠** | ① → ② → **async ③** → ④（与 ③ 并行）→ **wait ③** |
+| **重叠（训练常用）** | ① → ② → **async ③** → ④（与 ③ 并行）→ wait ③ → 上一层 |
 
 ```text
-SM:     [──①②──][──── ④ dW1,dW2 ────][ wait ][ 上一层 backward ]
-链路:            [── async all-reduce dx ──]
+SM:     [──①②──][──── ④ dW1,dW2（大 matmul）────][ wait ][ 上一层 bwd ]
+链路:            [──── async all-reduce dx ────────]
+                      ↑ ④ 与 ③ 并行：推理前向没有 ④ 这一步
 ```
 
-**对比推理 prefill 前向：** 前向路径上 **仅有** 激活 all-reduce；训练反向 **额外** 提供同层 $dW$ matmul，可与 $dx$ all-reduce **并行**。Prefill 偏 **算力**；Decode 偏 **KV 读与延迟**——与训练 FLOP 公式是 **不同维度**。
+Attention 反向 **对称**：输出投影入口规约 $dx$，与 QKV 的 $dW$ 可同样并行。
+
+**训练 vs 推理 overlap 对照：**
+
+| | 推理 Prefill | 推理 Decode | 训练（前+反） |
+|--|--------------|-------------|---------------|
+| 层内「算 $dW$ 垫 $dx$ AR」 | 无（仅前向） | 无 | **有** |
+| 前向 AR 与下一 matmul | 串行 wait | 串行 wait | 串行 wait |
+| 抬高吞吐的主招 | 大 $S$ 天然胖 | **continuous batching** | 大 batch + backward overlap |
+| 每层 AR 次数 / 全步 | 2（前向） | 2（前向）× 每 token | **4**（前 2 + 反 2） |
+
+---
+
+### 8.5 一张图记推理 TP overlap
+
+```text
+                    推理能 overlap 的          推理层内仍串行的
+                    ─────────────────          ─────────────────
+Prefill:            双流 / 多请求              partial → AR → 下一子层
+Decode B=1:         几乎只有调度填缝           64 次 AR/step，消息 16KB/层
+Decode B=32:        消息 512KB/层，matmul 胖   同上，但带宽利用率↑
+训练反向:           dx async + dW 并行         （推理路径不含此支）
+```
 
 ---
 
 ## 9. 复习清单
 
-1. 一个 block 前向几次 TP all-reduce？消息多大？  
-   → **4 次**；每层合计 **$8BSD$** 字节（FP16 本体）。
+1. 推理前向，一个 block 几次 TP all-reduce？每层合计消息？  
+   → **2 次**（Attention 出口 1 + FFN 出口 1）；每层 **$4BSD$** 字节（FP16）。
 
-2. Prefill $B{=}1,S{=}2048,D{=}4096$：单层通信？整模 32 层？  
-   → **67 MB/层**；Prefill pass **≈ 2.1 GB**。
+2. Prefill $B{=}1,S{=}2048,D{=}4096$：单层？32 层 pass？  
+   → **≈34 MB/层**；Prefill pass **≈ 1.1 GB**。
 
-3. Decode $B{=}1,S_{\mathrm{ctx}}{=}2048$：每 token 每 layer 通信？整步 32 层？  
-   → **32 KB/层**；**1 MB/step**；collective **128 次/step**。
+3. Decode $B{=}1$：单层？每 step？collective 次数？  
+   → **16 KB/层**；**512 KB/step**；**64 次/step**（$2L$，$L{=}32$）。
 
-4. continuous batching $B{=}1\to32$ 改变了什么？  
-   → 次数 **相同**；单次消息 **×32**；matmul 行维 **×32**；瓶颈从 **延迟** 移向 **带宽+算力**。
+4. 讲义「4 次 / 8 系数」指什么？  
+   → **训练全步** 每层 4 次 AR（前 2 + 反 2）；**8 = 4 × 环形 2 段**。
 
-5. Decode 下单层算力（$B{=}1$，上例）？  
-   → Attn + FFN **≈ 277 MFLOP/层**；整步 **≈ 9 GFLOP**。
+5. continuous batching $B{=}1\to32$？  
+   → 次数 **64 不变**；单层消息 **16 KB → 512 KB**；matmul 行维 ×32。
 
-6. TP / CP / EP 各切什么？  
+6. 推理 vs 训练，TP overlap 差在哪？  
+   → 训练反向 **$dx$ async + $dW$ 并行**；推理靠 **continuous batching + 双流**。
+
+7. TP / CP / EP 各切什么？  
    → TP：层内矩阵；CP：序列/KV；EP：MoE 专家。
 
 ---
@@ -493,8 +606,8 @@ SM:     [──①②──][──── ④ dW1,dW2 ────][ wait ][ 上
 | 阶段 | 主导矛盾 | TP | CP | EP |
 |------|----------|----|----|-----|
 | **Prefill** | 算力 + 大块通信 | 大 all-reduce，大 matmul **同 pass** | 大 KV 交换 | 大 dispatch burst |
-| **Decode** | KV 带宽 + 延迟栈 | 小 all-reduce **高频**；$B=1$ 时 **32 KB×128 次/step** | 跨片读 cache | 逐步 all-to-all |
+| **Decode** | KV 带宽 + 延迟栈 | **2L 次/token**；$B{=}1$ 时 **512 KB/step** | 跨片读 cache | 逐步 all-to-all |
 
-**Decode 核心数字（$D{=}4096,S_{\mathrm{ctx}}{=}2048,L{=}32$）：** $B=1$ → **1 MB/step、≈9 GFLOP/step**；$B=32$ → **32 MB/step、≈285 GFLOP/step**，collective 次数 **仍为 128**。
+**Decode 核心数字（$D{=}4096,S_{\mathrm{ctx}}{=}2048,L{=}32$）：** $B=1$ → **512 KB/step、64 次 AR、≈9 GFLOP**；$B=32$ → **16 MB/step、64 次 AR、≈285 GFLOP**。
 
-**Overlap 在推理里：** 靠 **continuous batching** 把 Decode 的 matmul 与 all-reduce **撑宽**；同一 token、同一层上 matmul 与 all-reduce **串行**：partial sum → 规约 → 下一层。
+**Overlap：** 推理靠 **continuous batching** 撑宽 AR 与 matmul；训练 **额外** 靠反向 **$dx$ async + $dW$**（§8）。层内 partial → AR → 下一子层 **始终串行**。
