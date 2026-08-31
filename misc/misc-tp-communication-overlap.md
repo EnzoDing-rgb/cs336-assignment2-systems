@@ -396,7 +396,7 @@ FFN matmul 形状从 $(1, D) \times (D, D_{\mathrm{FF}})$ 变为 $(32, D) \times
 | 单层通信 $8BSD$ | 67 MB（$S{=}2048$） | 32 KB | 1 MB |
 | 调用频率 | 每层 × **1 次 prefill** | 每层 × **每个 token** | 同左，消息宽 32× |
 | 单层算力 | ≈ 567 GFLOP/层 | ≈ 277 MFLOP/层 | ≈ 8.9 GFLOP/层（整步 ≈ 285 GFLOP） |
-| 瓶颈 | 带宽 + 算力 | **延迟 + 碎 sync** | 带宽 + 算力（改善） |
+| 瓶颈 | 带宽 + 算力 | **延迟栈** | 带宽 + 算力（改善） |
 | 加 TP 的边际收益 | **高**（权重分摊 + 大 matmul） | **低**（消息轻、次数多） | **回升**（$B$ 撑宽消息与 matmul） |
 
 **Overlap（Decode）：** $B=1$ 时单层 matmul **块小**，垫通信窗口 **窄**；continuous batching 把 **多请求拼进同一个 $B$**，与 **EP dispatch 流水线** 一起填 GPU 空档。
