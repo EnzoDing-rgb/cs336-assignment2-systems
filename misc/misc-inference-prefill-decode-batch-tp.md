@@ -1,7 +1,7 @@
-# 推理：Prefill、Decode 与 Batch Size —— 算力强度与 Tensor 并行判定
+# 推理：Prefill、Decode 与 Batch Size（先无 TP，再有 TP）
 
-> **范围：** 推理前向；并行只看 **TP**（张量并行）。  
-> **两个问题：** ① Prefill / Decode 的 **计算强度** 为何不同 → Batch Size 需求不同；② 何时 **值得开 TP** → 给出 **$B$、$S$、$N_{\mathrm{TP}}$** 的量化阈值。
+> **读法：** 先假设 **整模型在单卡上**（$N_{\mathrm{TP}}=1$，无跨卡 all-reduce），把 Prefill / Decode / Batch 的关系算清楚；再叠 **Tensor 并行**，看通信税与量化阈值。  
+> **模型常量（全文共用）：** $D=4096$，$D_{\mathrm{FF}}=14336$，$L=32$；有效算力 $C=150\ \mathrm{TFLOP/s}$（Prefill 峰值附近），Decode 小矩阵有效 $C_{\mathrm{eff}}\approx 30\ \mathrm{TFLOP/s}$。
 
 ---
 
@@ -9,439 +9,392 @@
 
 | 符号 | 含义 |
 |------|------|
-| $B$ | 同时服务的序列条数（continuous batching 的 batch） |
-| $S$ | Prefill：prompt 长度；Decode：all-reduce 形状里的序列维 **= 1** |
-| $S_{\mathrm{ctx}}$ | Decode：KV cache 已有长度（算力读 cache 用） |
-| $D$ | hidden size |
-| $D_{\mathrm{FF}}$ | FFN 中间维 |
-| $L$ | Transformer 层数 |
-| $N_{\mathrm{TP}}$ | 张量并行度 |
-| $C$ | 单卡有效算力（FLOP/s，推理 FP16/BF16 .tensor core） |
-| $W$ | 单卡出向带宽（字节/s，NVLink / PCIe） |
-| $\tau$ | 单次 collective 固定延迟（秒/次；launch + 同步，经验 **10–50 μs**） |
-
-**TP 推理前向（Megatron）：** 每层 **2 次** all-reduce（Attention 出口 + FFN 出口）。  
-每层通信消息本体（FP16）：
-
-$$
-S_{\mathrm{TP,layer}} = 4\,B S D \quad\text{字节}.
-$$
-
-整步 Decode（$S=1$）collective **次数** $= 2L$。
+| $B$ | 同时服务的序列条数（continuous batching） |
+| $S$ | Prefill：prompt 长度 |
+| $S_{\mathrm{ctx}}$ | Decode：KV cache 已有长度 |
+| $N_{\mathrm{TP}}$ | 张量并行度；**第一节固定为 1** |
+| $C,\,C_{\mathrm{eff}}$ | 峰值 / 小矩阵有效算力 |
+| $W$ | 单卡出向带宽（**仅第二节 TP 用**） |
+| $\tau$ | 单次 kernel / collective 固定延迟（**10–50 μs**） |
 
 ---
 
-# 第一部分：Prefill vs Decode 的计算强度 —— 为何 Decode 要排大 Batch
+# 第一节 · 无 TP（$N_{\mathrm{TP}}=1$）
 
-## 1.1 什么叫「计算强度」
-
-这里用两个互补指标：
-
-| 指标 | 定义 | 直觉 |
-|------|------|------|
-| **算力 $F$** | 一次 pass / step 的总 FLOPs（每 TP 卡） | 算得多不多 |
-| **算术强度 $I$** | $I = F / M_{\mathrm{mem}}$（FLOPs / 激活字节访问量） | 每读 1 字节激活能算几次运算 |
-| **有效并行度** | matmul 的 $m$ 维（Prefill：$B\!\cdot\!S$；Decode：$B$） | GPU 核能不能打满 |
-
-Prefill **自带大 $S$** → $m = B\!\cdot\!S$ 很大；Decode **$S=1$** → $m = B$，**只靠 $B$ 撑并行度**。
+单卡持有 **完整权重**；前向 **零跨卡通信**。瓶颈只有：**算力、matmul 形状、KV 读带宽、每层 kernel 启动**。
 
 ---
 
-## 1.2 每层算力公式（每 TP 卡）
+## 1.1 Prefill vs Decode：算力公式
 
-**Prefill**（一次算完 prompt）：
+**Prefill**（一次算完 prompt，每层每卡）：
 
 $$
 F_{\mathrm{prefill,layer}}
-\approx
-\underbrace{4 B S^2 D}_{\text{Attention }QK^\top,\,AV}
+=
+4 B S^2 D
 +
-\underbrace{\frac{8 B S D^2}{N_{\mathrm{TP}}}}_{\text{QKV / 输出投影}}
+8 B S D^2
 +
-\underbrace{\frac{6 B S D D_{\mathrm{FF}}}{N_{\mathrm{TP}}}}_{\text{FFN}}.
+6 B S D D_{\mathrm{FF}}.
 $$
 
-**Decode**（Cache 路径，每 step 1 个新 token / 序列）：
+**Decode**（KV cache，每层每卡，每 step）：
 
 $$
 F_{\mathrm{decode,layer}}
-\approx
+=
 4 B S_{\mathrm{ctx}} D
 +
-\frac{8 B D^2}{N_{\mathrm{TP}}}
+8 B D^2
 +
-\frac{6 B D D_{\mathrm{FF}}}{N_{\mathrm{TP}}}.
+6 B D D_{\mathrm{FF}}.
 $$
 
-**对 $B$ 的缩放：**
+**matmul 的「行维」$m$：**
 
-| 阶段 | $F$ 随 $B$ | 「胖」从哪来 |
-|------|------------|--------------|
-| Prefill | **线性** $\propto B$ | **$S$ 已在式子里**（$S^2$ 项） |
-| Decode | **线性** $\propto B$ | **只有 $B$**；$S_{\mathrm{ctx}}$ 涨得再长也不增大 $m$ 维 |
+| 阶段 | 主 matmul 行维 | 谁提供「胖矩阵」 |
+|------|----------------|------------------|
+| Prefill | $m = B \cdot S$ | **$S$**（prompt 长度） |
+| Decode | $m = B$ | **只有 $B$** |
 
 ---
 
-## 1.3 算例：Llama 量级（$D=4096$，$D_{\mathrm{FF}}=14336$，$N_{\mathrm{TP}}=2$，$L=32$）
+## 1.2 算例：$B=1$ 已经够胖 vs 必须靠 Batch
 
 ### Prefill：$B=1$，$S=2048$
 
 ```text
-每层 FLOPs:
-  Attention:  4·1·2048²·4096  +  8·1·2048·4096²/2  ≈  206 GFLOP
-  FFN:        6·1·2048·4096·14336/2               ≈  361 GFLOP
-  合计 ≈ 567 GFLOP/层  →  整 pass ≈ 18 TFLOP/卡
+Attention:  4·2048²·4096  +  8·2048·4096²   ≈  275 GFLOP
+FFN:        6·2048·4096·14336              ≈  722 GFLOP
+合计 ≈ 997 GFLOP/层  →  整 pass ≈ 32 TFLOP
 
-matmul 主维度:  m = B·S = 2048  （单请求已很胖）
+m = B·S = 2048
+T_compute ≈ 32 TFLOP / 150 TFLOP/s ≈ 210 ms
 ```
 
-设 $C = 150\ \mathrm{TFLOP/s}$：
-
-$$
-T_{\mathrm{compute,prefill}} \approx 18\ \mathrm{TFLOP} / 150\ \mathrm{TFLOP/s} \approx 120\ \mathrm{ms}.
-$$
-
-**Prefill 在 $B=1$ 时已接近算力饱和** —— prompt 长度 $S$ 充当「隐式 batch 维」。
+**$B=1$ 时 $m=2048$**，Tensor Core 已处于高效区；**Prefill 不需要为了「把矩阵乘胖」去排大 Batch**。
 
 ### Decode：$B=1$，$S_{\mathrm{ctx}}=2048$
 
 ```text
-每层 FLOPs:
-  Attention:  4·1·2048·4096  +  8·4096²/2        ≈  101 MFLOP
-  FFN:        6·1·4096·14336/2                     ≈  176 MFLOP
-  合计 ≈ 277 MFLOP/层  →  整 step ≈ 8.9 GFLOP/卡
+Attention:  4·2048·4096  +  8·4096²        ≈  168 MFLOP
+FFN:        6·4096·14336                    ≈  353 MFLOP
+合计 ≈ 521 MFLOP/层  →  整 step ≈ 16.7 GFLOP
 
-matmul 主维度:  m = B = 1  （极窄）
+m = 1
+T_peak ≈ 16.7 GFLOP / 150 TFLOP/s ≈ 0.11 ms   ← 峰值，达不到
+T_eff  ≈ 16.7 GFLOP /  30 TFLOP/s ≈ 0.56 ms   ← 小矩阵有效算力
 ```
 
-同样 $C = 150\ \mathrm{TFLOP/s}$，**峰值**算完只需：
+**$B=1$ 时 $m=1$**，matmul 极窄；算力仅为 Prefill 同 $B$ 下单层的 **~1/2000**。
 
-$$
-T_{\mathrm{peak}} \approx 8.9\ \mathrm{GFLOP} / 150\ \mathrm{TFLOP/s} \approx 0.06\ \mathrm{ms}.
-$$
-
-实际远慢于此：小矩阵 **有效 $C$** 常只有峰值的 **1–10%**；且 TP 还有 **固定延迟**（下节）。
-
-### Decode：$B=32$（continuous batching）
+### Decode：$B=32$
 
 ```text
-整 step FLOPs ≈ 8.9 GFLOP × 32 ≈ 285 GFLOP
-matmul 主维度:  m = 32
+整 step FLOPs ≈ 16.7 × 32 ≈ 534 GFLOP
+m = 32
+T_eff ≈ 534 GFLOP / 30 TFLOP/s ≈ 18 ms
 ```
 
-**同一硬件上，Decode 要靠 $B$ 把 $m$ 从 1 拉到 32，才接近 Prefill 的「矩阵够胖、核够满」。**
+**加大 $B$ 把 $m$ 从 1 拉到 32**，Decode 才进入「矩阵够宽、核够满」的区间。
 
 ---
 
-## 1.4 固定延迟：Decode 为何特别怕 $B=1$
+## 1.3 无 TP 时 Decode 为何要 continuous batching
 
-Decode 每 step 的 TP 通信（$S=1$）：
+除 matmul 行维外，单卡 Decode 还有 **固定开销**（每层一次前向链，$L$ 层 / step）：
 
 $$
-M_{\mathrm{step}} = 4 B D L \quad\text{字节（消息本体）};\qquad N_{\mathrm{call}} = 2L.
+T_{\mathrm{step,fix}} \approx L \cdot \tau_{\mathrm{kern}}
+\quad\text{（$\tau_{\mathrm{kern}}$：每层调度 + kernel 启动，经验 10–30 μs）}.
 $$
 
-$B=1$，$L=32$，$D=4096$：$M_{\mathrm{step}} = 512\ \mathrm{KB}$，$N_{\mathrm{call}} = 64$。
+$L=32$，$\tau_{\mathrm{kern}}=20\ \mu s$ → $T_{\mathrm{fix}} \approx 0.64\ \mathrm{ms}$。
 
-| 腿 | $B=1$ | $B=32$ |
-|----|-------|--------|
-| 带宽时间 $M/W$（$W{=}100\ \mathrm{GB/s}$） | ≈ 0.005 ms | ≈ 0.16 ms |
-| 延迟时间 $N_{\mathrm{call}}\cdot\tau$（$\tau{=}20\ \mu s$） | **≈ 1.3 ms** | **≈ 1.3 ms**（次数相同） |
-| 算力 $F$（上例） | ≈ 8.9 GFLOP | ≈ 285 GFLOP |
+| | $B=1$ | $B=32$ |
+|--|-------|--------|
+| 有效算力时间 $T_{\mathrm{eff}}$ | ≈ 0.56 ms | ≈ 18 ms |
+| 固定开销 $T_{\mathrm{fix}}$ | ≈ 0.64 ms | ≈ 0.64 ms |
+| 合计粗估 | **~1.2 ms/step** | **~19 ms/step** |
+| 每 token 摊销（32 序列并行） | 1.2 ms / 1 | 19 ms / 32 ≈ 0.6 ms/token 吞吐 |
 
-**$B=1$ Decode：** 延迟 **≈ 1.3 ms** 与有效计算 **同阶**；带宽几乎空闲。  
-**$B=32$ Decode：** 算力 **×32**，延迟 **不变** → 算力占比上升。
-
-**Decode 临界 batch（延迟 vs 算力，粗估）：**
+**无 TP 临界 batch（算力 + 固定开销）：**
 
 $$
 \boxed{
-B_{\mathrm{crit,lat}}
+B_{\mathrm{crit}}^{\mathrm{(no TP)}}
 \;\approx\;
-\frac{N_{\mathrm{call}}\,\tau}{T_{\mathrm{comp}}(B{=}1)}
+\frac{L\,\tau_{\mathrm{kern}}}{F_{\mathrm{step}}(B{=}1)/C_{\mathrm{eff}}}
 \;\approx\;
-\frac{2L\,\tau}{F_{\mathrm{step}}(B{=}1)/C_{\mathrm{eff}}}.
+\frac{L\,\tau_{\mathrm{kern}}}{T_{\mathrm{eff}}(B{=}1)}.
 }
 $$
 
-代入 $L=32$，$\tau=20\ \mu s$，$F_{\mathrm{step}}(B{=}1)=8.9\ \mathrm{GFLOP}$，$C_{\mathrm{eff}}=30\ \mathrm{TFLOP/s}$（小矩阵有效算力）：
+代入：$T_{\mathrm{eff}}(1)\approx 0.56\ \mathrm{ms}$，$L\tau_{\mathrm{kern}}\approx 0.64\ \mathrm{ms}$ → $B_{\mathrm{crit}}^{\mathrm{(no TP)}} \approx 1\text{–}8$（偏保守）；工程上仍常取 **$B \gtrsim 16\text{–}32$**，因还要 **KV 读带宽、多请求吞吐** 一并考虑。
 
-$$
-T_{\mathrm{comp}}(1) \approx 0.3\ \mathrm{ms},\quad
-B_{\mathrm{crit,lat}} \approx 1.28/0.3 \approx 4\text{–}20
-\quad\text{（随 $\tau$、$C_{\mathrm{eff}}$ 浮动）}.
-$$
-
-工程上 **$B \gtrsim 16\text{–}32$** 是 continuous batching 的常见目标区。
+**matmul 效率阈值（另一条线）：** Tensor Core 高效区常需 $m \gtrsim 64$ → **Decode 目标 $B \gtrsim 64$** 才与 Prefill 的 $m=2048$ 同量级效率（Prefill 用 $S$，Decode 用 $B$）。
 
 ---
 
-## 1.5 对比总表：为何 Prefill 不等 Batch、Decode 要等 Batch
+## 1.4 无 TP 对比总表
 
 | | **Prefill** | **Decode** |
 |--|-------------|------------|
-| matmul 行维 | $B \cdot S$（$S$ 常 $\gg 1$） | $B$（$S=1$） |
-| $B=1$ 时算力 | **18 TFLOP**（$S=2048$） | **8.9 GFLOP** |
-| 固定 collective 次数 / 单位工作 | $2L$ **/ pass** | $2L$ **/ token** |
-| 瓶颈（$B=1$） | 算力 + 带宽 | **延迟 + 窄 matmul** |
-| 加大 $B$ 的作用 | 吞吐 $\uparrow$（多用户 prompt） | **把 $m$ 维撑胖 + 摊延迟** |
-| 是否「必须」大 batch | **单用户 $S$ 已够** | **强依赖 continuous batching** |
+| matmul 行维 | $B \cdot S$ | $B$ |
+| $B=1$ 典型 $m$ | 2048（$S=2048$） | **1** |
+| $B=1$ 整 pass/step 算力 | **≈32 TFLOP** | **≈17 GFLOP** |
+| 靠谁变胖 | **$S$** | **$B$** |
+| 是否需要大 Batch | **单用户 $S$ 已够** | **需要 continuous batching** |
+| 跨卡通信 | **无** | **无** |
 
-**一句话：** Prefill 的「batch 维」在 **$S$**；Decode 的「batch 维」只能靠 **$B$**。
-
----
-
-# 第二部分：Prefill / Decode 要不要 Tensor 并行 —— 量化判定
-
-TP 做两件事：**① 切权重，让模型装进多卡；② 每层 2 次 all-reduce，付通信税。**
-
-下面分 **必开 TP** 与 **通信是否划算** 两层说。
+**第一节结论（无 TP）：** Prefill 的 batch 维在 **$S$**；Decode 的 batch 维只能靠 **$B$**。与是否开 TP **无关**——这是 **matmul 形状** 的结构性差异。
 
 ---
 
-## 2.1 必开 TP：权重装不下
+## 1.5 无 TP 时要不要「并行」？
 
-单卡权重（FP16，SwiGLU FFN，忽略 Embedding 粗算）：
+单卡能装下 **权重 + KV + 激活** → **$N_{\mathrm{TP}}=1$ 即可**，Prefill 与 Decode 逻辑 **同上表**。
+
+**权重粗算（FP16）：**
 
 $$
-M_{\mathrm{weights}}
+M_{\mathrm{weights}} \approx L(4D^2 + 3DD_{\mathrm{FF}})\cdot 2
+\approx 16\ \mathrm{GB}\quad (D{=}4096,\,D_{\mathrm{FF}}{=}14336,\,L{=}32).
+$$
+
+| 显存 | 无 TP |
+|------|-------|
+| 80 GB 卡，16 GB 权重 | **$N_{\mathrm{TP}}=1$**；第二节 TP 为 **可选项** |
+| 70B（$\sim$140 GB 权重） | 单卡装不下 → **必须进入第二节 TP** |
+
+**无 TP 时不存在 all-reduce 阈值**；Decode 仍按 **$B_{\mathrm{crit}}^{\mathrm{(no TP)}}$** 排 batch。
+
+---
+
+# 第二节 · 有 TP（$N_{\mathrm{TP}} \ge 2$）
+
+在第一节 **同一套算力公式** 上，权重按 Megatron **切分到 $N_{\mathrm{TP}}$ 卡**；每层前向 **+2 次 all-reduce**（Attention 出口 + FFN 出口）。
+
+---
+
+## 2.1 相对无 TP，多了什么
+
+| 项 | 无 TP | 有 TP |
+|----|-------|-------|
+| 权重 / 卡 | 全量 $M_{\mathrm{weights}}$ | $\approx M_{\mathrm{weights}}/N_{\mathrm{TP}}$ |
+| 层内 FFN / 投影 FLOPs | 全量 | $\approx \times 1/N_{\mathrm{TP}}$（宽维切分） |
+| Attention $BS^2D$ 项 | 全量 | **各卡仍算完整**（按头/块切，量级同阶） |
+| 跨卡通信 | 0 | 每层 **$4BSD$** 字节（FP16，2 次 AR） |
+| Decode 每 step 通信次数 | 0 | **$2L$** 次 |
+
+**有 TP 的每层算力（每卡）：**
+
+$$
+F_{\mathrm{prefill,layer}}^{\mathrm{(TP)}}
 \approx
-L \cdot \bigl(4 D^2 + 3 D D_{\mathrm{FF}}\bigr) \cdot 2\ \text{字节}.
+4 B S^2 D
++
+\frac{8 B S D^2 + 6 B S D D_{\mathrm{FF}}}{N_{\mathrm{TP}}},
+\qquad
+F_{\mathrm{decode,layer}}^{\mathrm{(TP)}}
+\approx
+4 B S_{\mathrm{ctx}} D
++
+\frac{8 B D^2 + 6 B D D_{\mathrm{FF}}}{N_{\mathrm{TP}}}.
 $$
 
-$D=4096$，$D_{\mathrm{FF}}=14336$，$L=32$：
-
-$$
-M_{\mathrm{weights}} \approx 32 \cdot (4\cdot4096^2 + 3\cdot4096\cdot14336) \cdot 2
-\approx 32 \ \mathrm{GB}.
-$$
-
-**判定（硬条件）：**
-
-$$
-\boxed{
-M_{\mathrm{weights}} > M_{\mathrm{GPU}}
-\;\Longrightarrow\;
-N_{\mathrm{TP}} \ge \left\lceil \frac{M_{\mathrm{weights}}}{M_{\mathrm{GPU}}} \right\rceil.
-}
-$$
-
-Prefill 与 Decode **共用权重** → **两阶段适用性相同**。  
-80 GB 卡、上例模型：**$N_{\mathrm{TP}}=1$ 可装**；70B 量级：**$N_{\mathrm{TP}} \ge 2\text{–}8$ 硬需求**。
+**Attention 的 $4BS^2D$（Prefill）与 $4BS_{\mathrm{ctx}}D$（Decode）不除 $N_{\mathrm{TP}}$** → TP **主要省 FFN/投影**，**不省** Attention 二次项（Prefill）或 cache 读取（Decode）。
 
 ---
 
-## 2.2 通信是否压过算力：Prefill
+## 2.2 有 TP 的通信公式
 
-每层 TP 通信时间（2 次环形 all-reduce，与 handout 一致）：
+每层 2 次环形 all-reduce，消息各 $2BSD$ 字节：
 
 $$
-T_{\mathrm{comm,layer}}
+T_{\mathrm{comm,layer}}^{\mathrm{(TP)}}
 =
 \frac{8\,(N_{\mathrm{TP}}-1)\,B S D}{N_{\mathrm{TP}}\,W}.
 $$
 
-每层算力时间：
+Decode（$S=1$）整 step：
 
 $$
-T_{\mathrm{comp,layer}}
+M_{\mathrm{step}}^{\mathrm{(TP)}} = 4 B D L\ \text{字节},\qquad
+N_{\mathrm{call}} = 2L,\qquad
+T_{\mathrm{comm,step}}^{\mathrm{(TP)}}
 =
-\frac{4 B S^2 D + \dfrac{8 B S D^2 + 6 B S D D_{\mathrm{FF}}}{N_{\mathrm{TP}}}}{C}.
+\frac{8\,(N_{\mathrm{TP}}-1)\,B D L}{N_{\mathrm{TP}}\,W}.
 $$
 
-**长 prompt 时 Attention 的 $4BS^2D$ 主导。** 令 $T_{\mathrm{comm,layer}} \ge T_{\mathrm{comp,layer}}$ 且只保留主项（$B>0$ 约掉）：
+**相对无 TP 新增延迟：** $N_{\mathrm{call}}\cdot\tau$（NCCL collective，$\tau \approx 20\ \mu s$）。
+
+---
+
+## 2.3 算例：$N_{\mathrm{TP}}=2$ 与无 TP 对照
+
+### Prefill：$B=1$，$S=2048$
+
+| | 无 TP | 有 TP（$N_{\mathrm{TP}}=2$） |
+|--|-------|------------------------------|
+| 算力 / pass | ≈ 32 TFLOP | ≈ 18 TFLOP（FFN 减半，Attn 仍大） |
+| 通信 | 0 | ≈ 1.1 GB / pass |
+| $T_{\mathrm{compute}}$ | ≈ 210 ms | ≈ 120 ms |
+| $T_{\mathrm{comm}}$ | 0 | ≈ 11 ms（$W=100$ GB/s） |
+
+**Prefill + TP：** $S$ 仍提供 $m=2048$；通信相对算力 **小** → **$B=1$ 仍够**。
+
+### Decode：$B=1$，$S_{\mathrm{ctx}}=2048$
+
+| | 无 TP | 有 TP（$N_{\mathrm{TP}}=2$） |
+|--|-------|------------------------------|
+| 算力 / step | ≈ 17 GFLOP | ≈ 8.9 GFLOP |
+| 通信 / step | 0 | **512 KB** |
+| collective / step | 0 | **64 次** |
+| 新增 $N_{\mathrm{call}}\tau$ | — | **≈ 1.3 ms** |
+
+**Decode + TP：** 在无 TP 已偏窄的 matmul 上，再叠 **64 次 collective** → **更依赖大 $B$**。
+
+### Decode：$B=32$（有 TP）
+
+| | 无 TP | 有 TP |
+|--|-------|-------|
+| 算力 / step | ≈ 534 GFLOP | ≈ 285 GFLOP |
+| 通信 / step | 0 | **16 MB** |
+| collective 次数 | — | **64**（不变） |
+
+**$B$ 翻倍消息与算力；collective 次数不变** → 摊薄 **单次 AR 延迟**。
+
+---
+
+## 2.4 有 TP：Prefill / Decode 量化判定
+
+### （A）硬条件：必开 TP
 
 $$
-\frac{8(N_{\mathrm{TP}}-1)}{N_{\mathrm{TP}} W}
-\ge
-\frac{4 S^2 D}{C}
-\quad\Longrightarrow\quad
+\boxed{
+N_{\mathrm{TP}} \;\ge\;
+\left\lceil \frac{M_{\mathrm{weights}}}{M_{\mathrm{GPU}}} \right\rceil.
+}
+$$
+
+Prefill 与 Decode **共用权重** → **同一 $N_{\mathrm{TP}}$**。
+
+### （B）Prefill：通信是否压算力（$B$ 约掉）
+
+令 $T_{\mathrm{comm,layer}}^{\mathrm{(TP)}} \ge T_{\mathrm{comp,layer}}^{\mathrm{(TP)}}$，Attention 主项 $4BS^2D$ 主导：
+
+$$
 \boxed{
 S \;\le\;
-S_{\mathrm{crit,prefill}}
+S_{\mathrm{crit,prefill}}^{\mathrm{(TP)}}
 =
 \sqrt{\frac{2\,(N_{\mathrm{TP}}-1)\,C}{N_{\mathrm{TP}}\,W\,D}}.
 }
 $$
 
-**读法：** prompt **短于** $S_{\mathrm{crit,prefill}}$ 时，TP 通信相对 **重**；**长于** 该值时，Prefill **算力主导**，TP **更划算**。
+$N_{\mathrm{TP}}=2$，$C=150$ TFLOP/s，$W=100$ GB/s → **$S_{\mathrm{crit,prefill}}^{\mathrm{(TP)}} \approx 192$**。
 
-**数值（$N_{\mathrm{TP}}=2$，$C=150\ \mathrm{TFLOP/s}$，$W=100\ \mathrm{GB/s}$，$D=4096$）：**
+| $S$ | 含义 |
+|-----|------|
+| $\gtrsim 192$ | Prefill **算力主导**；**$B=1$ 即可**（与无 TP 结论一致，多付通信） |
+| $\ll 192$ | TP 通信 **相对重**；仍可能因 **装权重** 必须 TP |
 
-$$
-S_{\mathrm{crit,prefill}}
-=
-\sqrt{\frac{2 \cdot 1 \cdot 150\times10^{12}}{2 \cdot 100\times10^{9} \cdot 4096}}
-\approx
-\sqrt{36.6\times10^{3}}
-\approx
-192.
-$$
-
-| $S$ | Prefill 上 TP |
-|-----|----------------|
-| 512、2048、… | **算力主导**；$B=1$ 即可 |
-| $\ll 192$（极短 prompt） | 通信用量相对显；仍可能需要 TP **装权重** |
-
-**Prefill 对 $B$ 的阈值（通信视角）：** $B$ 在分子分母 **同阶约掉** → **Prefill 无 $B_{\mathrm{crit,TP}}$**；靠 **$S$** 养通信。
-
----
-
-## 2.3 通信是否压过算力：Decode
-
-每 **step**（生成 1 轮 token，$S=1$）：
-
-$$
-T_{\mathrm{comm,step}}
-=
-\frac{8\,(N_{\mathrm{TP}}-1)\,B D L}{N_{\mathrm{TP}}\,W},
-\qquad
-T_{\mathrm{comp,step}}
-=
-\frac{B L \bigl(4 S_{\mathrm{ctx}} D + \frac{8D^2 + 6D D_{\mathrm{FF}}}{N_{\mathrm{TP}}}\bigr)}{C}.
-$$
-
-长上下文时 $4 S_{\mathrm{ctx}} D$ 主导。令 $T_{\mathrm{comm,step}} \ge T_{\mathrm{comp,step}}$（$B$ 约掉）：
+### （C）Decode：通信 vs 读 cache 算力（$B$ 约掉）
 
 $$
 \boxed{
 S_{\mathrm{ctx}} \;\le\;
-S_{\mathrm{crit,decode,TP}}
+S_{\mathrm{crit,decode}}^{\mathrm{(TP)}}
 =
-\frac{2\,(N_{\mathrm{TP}}-1)\,C}{N_{\mathrm{TP}}\,W}.
+\frac{2\,(N_{\mathrm{TP}}-1)\,C}{N_{\mathrm{TP}}\,W}
+\;\approx\; 1500\ \text{tokens}\ \text{（上例）}.
 }
 $$
 
-**同一组 $C,W,N_{\mathrm{TP}}$：**
+| $S_{\mathrm{ctx}}$ | 含义 |
+|--------------------|------|
+| $\gtrsim 1500$ | 读 KV 算力 **渐增**，养得起 TP 通信 |
+| $\ll 1500$ | TP 通信 **相对重** |
 
-$$
-S_{\mathrm{crit,decode,TP}} \approx \frac{2 \cdot 1 \cdot 150\times10^{12}}{2 \cdot 100\times10^{9}}
-\approx 1500\ \text{tokens}.
-$$
-
-| $S_{\mathrm{ctx}}$ | Decode 上 TP（通信 vs 算力） |
-|--------------------|------------------------------|
-| $\ll 1500$ | 通信 **相对重**（仍可能有 **装权重** 硬需求） |
-| $\gtrsim 1500$ | 读 KV 算力 **渐增**，TP 通信 **相对轻** |
-
-**Decode 对 $B$ 的阈值（与 §1.4 合并）：**
+### （D）Decode：Batch 阈值（叠在无 TP 上）
 
 $$
 \boxed{
-B \;\ge\; B_{\mathrm{crit,decode}}
+B \;\ge\;
+B_{\mathrm{crit,decode}}^{\mathrm{(TP)}}
 \;\approx\;
 \max\!\left(
-B_{\mathrm{crit,lat}},\;
-B_{\mathrm{mem}}
+B_{\mathrm{crit}}^{\mathrm{(no TP)}},\;
+\frac{N_{\mathrm{call}}\,\tau}{T_{\mathrm{eff}}^{\mathrm{(TP)}}(B{=}1)}
 \right).
 }
 $$
 
-| 项 | 含义 | 量级（上例） |
-|----|------|--------------|
-| $B_{\mathrm{crit,lat}}$ | 摊 **$2L$ 次** collective 固定延迟 | **$\sim 16\text{–}32$** |
-| $B_{\mathrm{mem}}$ | KV + 激活不超显存 | 随 $S_{\mathrm{ctx}}$、$L$ 变 |
+| 来源 | 量级 |
+|------|------|
+| 无 TP：matmul 要胖 | **$B \gtrsim 16\text{–}64$** |
+| 有 TP：摊 **$2L$ 次** collective | **$B \gtrsim 16\text{–}32$**（$N_{\mathrm{call}}\tau \approx 1.3\ \mathrm{ms}$） |
 
-**$B_{\mathrm{crit,decode}}$ 与 $S_{\mathrm{crit,decode,TP}}$ 分工：**
+**Decode 排 batch：先满足第一节（$m$ 维），有 TP 时再抬 $B$ 摊 collective。**
 
-- **$S_{\mathrm{ctx}}$** 决定「读 cache 的算力够不够养 TP 通信」；
-- **$B$** 决定「窄 matmul + 固定延迟下 GPU 够不够满」。
-
----
-
-## 2.4 $N_{\mathrm{TP}}$ 开多大：通信临界点（Prefill 前向）
-
-由 tensor-parallel 前向临界（单层 FFN+Attn 粗界，handout 同型）：
+### （E）$N_{\mathrm{TP}}$ 开多大（Prefill 能否线性加速）
 
 $$
-T_{\mathrm{comm}} \ge T_{\mathrm{comp,fwd}}
-\;\Longrightarrow\;
 \boxed{
 N_{\mathrm{TP}} \;\ge\;
-1 + \frac{3}{2}\,D_{\mathrm{FF}}\,\frac{W}{C}.
+1 + \frac{3}{2}\,D_{\mathrm{FF}}\,\frac{W}{C}
+\;\approx\; 15
+\quad\Rightarrow\quad
+\text{再加 TP 卡，Prefill 通信开始压算力}.
 }
-$$
+```
 
-**数值（$D_{\mathrm{FF}}=14336$，$W/C = 1/1500$）：**
-
-$$
-N_{\mathrm{TP}} \;\ge\; 1 + \frac{3}{2}\cdot 14336 \cdot \frac{1}{1500} \approx 15.
-$$
-
-**读法：** 在 **Prefill 前向**、有效 $C/W \approx 1500$ 时，**$N_{\mathrm{TP}} \gtrsim 15$** 通信才开始压算力。  
-实际 **8 卡 TP** 仍常见 —— 主因是 **装权重**，该式是 **「加 TP 卡是否还能线性加速 Prefill」** 的上界，与 **「要不要 TP」** 两回事。
-
-**Decode** 有效 $C$ 更低 → 同一 $N_{\mathrm{TP}}$ 下 **Decode 更早撞通信墙** → 更依赖 **$B$**。
+这是 **「加卡是否还加速」**，与 **「要不要 TP 装模型」** 分开。
 
 ---
 
-## 2.5 决策流程（推理 · 仅 TP）
+## 2.5 有 TP 决策流程
 
 ```text
-                    权重是否装进单卡？
-                           │
-              ┌────────────┴────────────┐
-             否                         是
-              │                         │
-        开 TP，N_TP ≥ ⌈M_w/M_GPU⌉      可 N_TP = 1
-              │                         │
-              └────────────┬────────────┘
-                           │
-              ┌────────────┴────────────┐
-         Prefill 阶段              Decode 阶段
-              │                         │
-    S ≳ S_crit,prefill ?          B ≳ B_crit,decode ?
-    （~200，上例）                 （~16–32，continuous batching）
-              │                         │
-    S 大 → TP 通信养得起          B 大 → 延迟摊薄、matmul 变胖
-    S 小 → 通信占比↑              B 小 → 必须靠 batching 抬 B
-              │                         │
-              └────────────┬────────────┘
-                           │
-              两阶段共用同一 TP 组（权重一致）
-              Prefill 靠 S；Decode 靠 B + S_ctx 读 cache
+【无 TP 基线】单卡能装权重？
+        │
+       是 ──→ 第一节：Prefill 靠 S，Decode 靠 B（可 N_TP=1）
+        │
+       否 ──→ 进入 TP，N_TP ≥ ⌈M_w / M_GPU⌉
+                    │
+        ┌───────────┴───────────┐
+   Prefill                    Decode
+   S ≳ S_crit_prefill ?       B ≳ B_crit_decode ?
+   （~192）                    （~16–32，叠 collective）
+        │                           │
+   第一节结论仍成立：            第一节 + 摊 2L 次 AR
+   S 养算力；B=1 够            B 养 matmul + 养 TP 通信
+        └───────────┬───────────┘
+                    │
+           两阶段同一 N_TP 组
 ```
 
 ---
 
-## 2.6 量化判定速查表
+## 2.6 速查：无 TP vs 有 TP
 
-设 $C=150\ \mathrm{TFLOP/s}$，$W=100\ \mathrm{GB/s}$，$D=4096$，$D_{\mathrm{FF}}=14336$，$L=32$，$N_{\mathrm{TP}}=2$。
-
-| 判定 | 公式 | 上例数值 | 含义 |
-|------|------|----------|------|
-| 必开 TP | $M_{\mathrm{weights}} > M_{\mathrm{GPU}}$ | 32 GB vs 卡容 | 装不下就要 TP |
-| Prefill 算力主导 | $S \gtrsim S_{\mathrm{crit,prefill}}$ | $S \gtrsim 192$ | 短 prompt TP 通信相对显 |
-| Decode 算力养 TP | $S_{\mathrm{ctx}} \gtrsim S_{\mathrm{crit,decode,TP}}$ | $S_{\mathrm{ctx}} \gtrsim 1500$ | 短 ctx 读 KV 少，通信相对显 |
-| Decode 要 batch | $B \gtrsim B_{\mathrm{crit,decode}}$ | $B \gtrsim 16\text{–}32$ | continuous batching |
-| Prefill 加 TP 卡收益递减 | $N_{\mathrm{TP}} \gtrsim 1+\frac{3}{2}D_{\mathrm{FF}}W/C$ | $\gtrsim 15$ | 通信压算力（非「要不要 TP」） |
-
----
-
-## 2.7 结论：两阶段都适用 TP 吗？
-
-| 问题 | 答案 |
-|------|------|
-| **权重装得下，还要 TP 吗？** | 单卡能装 → **$N_{\mathrm{TP}}=1$ 可行**；Decode 延迟更低 |
-| **权重装不下** | **Prefill + Decode 都走同一 TP 组** |
-| **Prefill 需要大 $B$ 吗？** | **通常不需要**；$S$ 提供「隐式 fat batch」 |
-| **Decode 需要大 $B$ 吗？** | **需要**；$B_{\mathrm{crit,decode}} \sim 16\text{–}32$ 量级 |
-| **TP 更适合哪段？** | **Prefill 更吃算力、更养得起 TP 通信**；Decode **更怕 $B=1$**，靠 batching 补救 |
-| **实践** | **节点内 TP 两阶段共用**；优化 Decode → **continuous batching 抬 $B$**，Prefill 侧 **$S$ 自然够胖** |
-
----
-
-## 附录：与「8 系数 / 4 次 AR」的对照
-
-讲义 **训练全步** 每层 **4 次** all-reduce（前 2 + 反 2），系数 **8 = 4 × 环形 2 段**。  
-**推理前向** 每层 **2 次** → 本文通信公式用 **$4BSD$ / 层**（FP16 消息本体），**$2L$ 次 / decode step**。
+| 问题 | **无 TP** | **有 TP** |
+|------|-----------|-----------|
+| Prefill 要大 $B$ 吗？ | **$S$ 够**（$m=B\!\cdot\!S$） | **同左**；多 **$4BSDL$** 通信 |
+| Decode 要大 $B$ 吗？ | **要**（$m=B$） | **更要**（+ **$2L$ 次 AR**） |
+| 何时必须用 TP？ | 单卡装不下权重 | **$N_{\mathrm{TP}} \ge \lceil M_w/M_{\mathrm{GPU}}\rceil$** |
+| Prefill 通信阈值 | — | $S \gtrsim \sqrt{2(N{-}1)C/(NWD)}$ |
+| Decode 通信阈值 | — | $S_{\mathrm{ctx}} \gtrsim 2(N{-}1)C/(NW)$ |
+| Decode batch 阈值 | $B \gtrsim 16\text{–}64$ | $B \gtrsim 16\text{–}32$（含摊 AR） |
 
 ---
 
 ## 复习清单
 
-1. Prefill $B=1,S=2048$ 为何够胖？ → $m=B\!\cdot\!S=2048$，整 pass **≈18 TFLOP**。  
-2. Decode $B=1$ 为何瘦？ → $m=1$，**≈9 GFLOP/step** + **64 次** collective 延迟。  
-3. $B_{\mathrm{crit,decode}}$ 解决什么？ → 摊 **$2L\tau$**，放大 matmul 行维。  
-4. $S_{\mathrm{crit,prefill}}$ 解决什么？ → 短 prompt 时 TP 通信 **相对** 重。  
-5. 何时必开 TP？ → $M_{\mathrm{weights}} > M_{\mathrm{GPU}}$，与阶段无关。
+1. **无 TP**：Prefill $m=$？Decode $m=$？ → $B\!\cdot\!S$ vs $B$。  
+2. **无 TP**：$B=1,S=2048$ Prefill vs Decode 算力？ → **≈32 TFLOP** vs **≈17 GFLOP/step**。  
+3. **有 TP**：每层几次 AR？Decode 每 step 几次？ → **2 / 层**；**$2L$**（如 64）。  
+4. **有 TP**：Prefill 仍不需大 $B$ 的原因？ → **$S$ 养算力**（与无 TP 相同）。  
+5. **有 TP**：Decode 更要 batch 的原因？ → 第一节 $m=B$ **+** 摊 **$2L\tau$**。

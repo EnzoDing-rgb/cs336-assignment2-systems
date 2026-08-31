@@ -1,7 +1,7 @@
 # 推理并行：TP / CP / EP 与 Prefill–Decode 差异
 
 > **范围：** **推理**里的 **TP / CP / EP**，以及 **Prefill vs Decode**。  
-> **重点：** §6.2–§6.5 用 **Attention + FFN 一个 block** 的具体数字，算清通信、算力、以及 **continuous batching** 如何抬高 GPU 利用率。
+> **重点：** §6.2–§6.5 每层 **2 次** AR（Attn + FFN）；§8 推理 vs 训练 **overlap**。
 
 ---
 
@@ -241,7 +241,7 @@ Megatron 规矩：**列切入口、行切出口**；每个子层 **出口 1 次*
 训练再 + 反向：  Attention 入口 1 次 + FFN 入口 1 次  =  再 2 次（规约 dX）
 训练全步 / 层：  合计 4 次 all-reduce
 环形 NCCL：      每次 all-reduce ≈ 2 段（reduce-scatter + all-gather）
-讲义系数 8：     4 次 × 2 段 = 8  （乘在 bsh 上的那个 8，指训练全步，指 8 张卡）
+讲义系数 8：     4 次 × 环形 2 段 = 8  （训练全步；**与 TP 卡数 $N_{\mathrm{TP}}$ 无关**）
 ```
 
 **下文推理数字一律用前向 2 次 / 层：**
@@ -522,7 +522,7 @@ Decode 的 TP overlap **主要靠抬高 $B$**：次数 **64 不变**，单次消
 ③ comm / compute 双流     → async AR 与无依赖 kernel 并行
 ```
 
-训练独有的 **$dx$ async + $dW$ 并行**（§8.4），推理 **用不上**——推理路径 **只有前向**。
+训练独有的 **$dx$ async + $dW$ 并行**（§8.4）；推理路径 **仅含前向**，不含该 $dW$ 垫后窗口。
 
 ---
 
@@ -556,7 +556,7 @@ Attention 反向 **对称**：输出投影入口规约 $dx$，与 QKV 的 $dW$ �
 
 | | 推理 Prefill | 推理 Decode | 训练（前+反） |
 |--|--------------|-------------|---------------|
-| 层内「算 $dW$ 垫 $dx$ AR」 | 无（仅前向） | 无 | **有** |
+| 层内「$dW$ 垫 $dx$ all-reduce」 | 仅前向 | 仅前向 | **有**（反向） |
 | 前向 AR 与下一 matmul | 串行 wait | 串行 wait | 串行 wait |
 | 抬高吞吐的主招 | 大 $S$ 天然胖 | **continuous batching** | 大 batch + backward overlap |
 | 每层 AR 次数 / 全步 | 2（前向） | 2（前向）× 每 token | **4**（前 2 + 反 2） |

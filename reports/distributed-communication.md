@@ -350,7 +350,6 @@ Flatten/unflatten 的 memcpy 开销和总字节数成正比，而 NaiveDDP 的 p
 NaiveDDP:
   backward (每层梯度累积) → finish_gradient_synchronization (291 次 all_reduce)
   |──── compute ────|     |────────── communication ──────────|
-
 OverlapDDP:
   backward (每层梯度累积 → hook 立即发起 async all_reduce)
   |──── compute ────────────────────────|
