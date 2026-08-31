@@ -1,7 +1,7 @@
 # 推理并行：TP / CP / EP 与 Prefill–Decode 差异
 
-> **范围：** **推理**（inference）里的三种并行——**TP**（张量并行）、**CP**（上下文/序列并行）、**EP**（专家并行）。  
-> 本文自洽：先讲 **prefill vs decode**，再讲各并行切什么、传什么、overlap 长什么样。
+> **范围：** **推理**里的 **TP / CP / EP**，以及 **Prefill vs Decode**。  
+> **重点：** §6.2–§6.5 用 **Attention + FFN 一个 block** 的具体数字，算清通信、算力、以及 **continuous batching** 如何抬高 GPU 利用率。
 
 ---
 
@@ -493,6 +493,8 @@ SM:     [──①②──][──── ④ dW1,dW2 ────][ wait ][ 上
 | 阶段 | 主导矛盾 | TP | CP | EP |
 |------|----------|----|----|-----|
 | **Prefill** | 算力 + 大块通信 | 大 all-reduce，大 matmul **同 pass** | 大 KV 交换 | 大 dispatch burst |
-| **Decode** | KV 带宽 + 碎同步 | 小 all-reduce **高频** | 跨片读 cache | 逐步 all-to-all |
+| **Decode** | KV 带宽 + 延迟栈 | 小 all-reduce **高频**；$B=1$ 时 **32 KB×128 次/step** | 跨片读 cache | 逐步 all-to-all |
 
-**Overlap 在推理里：** 靠 **连续 batching、多请求调度、双流** 填 SM 与链路空档；**同一 token、同一层** 上，matmul 与 all-reduce **串行依赖**——先 partial sum，再规约，再下一层。
+**Decode 核心数字（$D{=}4096,S_{\mathrm{ctx}}{=}2048,L{=}32$）：** $B=1$ → **1 MB/step、≈9 GFLOP/step**；$B=32$ → **32 MB/step、≈285 GFLOP/step**，collective 次数 **仍为 128**。
+
+**Overlap 在推理里：** 靠 **continuous batching** 把 Decode 的 matmul 与 all-reduce **撑宽**；同一 token、同一层上 matmul 与 all-reduce **串行**：partial sum → 规约 → 下一层。
