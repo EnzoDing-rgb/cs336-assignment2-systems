@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>FSDP + TP · 2×4 GPU · 单层 FFN</title>
+<style>
+  :root {
+    --bg: #f6f4ef;
+    --ink: #1c1917;
+    --muted: #6b6560;
+    --line: #a8a29e;
+    --card: #fffdf8;
+    --weight: #c9b896;
+    --w-left: #ddd6b8;   /* TP 上行：宽维左半 w0-w3 */
+    --w-right: #b8a888;  /* TP 下行：宽维右半 w4-w7 */
+    --narrow-full: #fef9c3;
+    --narrow-part: #ffedd5;
+    --batch: #e9d5ff;
+    --fsdp-comm: #dbeafe;
+    --tp-comm: #fce7f3;
+    --mono: "IBM Plex Mono", "SF Mono", ui-monospace, monospace;
+    --sans: "IBM Plex Sans", "Noto Sans SC", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: var(--sans); color: var(--ink); background: var(--bg); line-height: 1.55; font-size: 15px; }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 28px 16px 64px; }
+  h1 { font-size: 1.45rem; margin: 0 0 8px; }
+  h2 { font-size: 1.12rem; margin: 32px 0 12px; padding-top: 12px; border-top: 2px solid #d6d0c4; }
+  h3 { font-size: 0.95rem; margin: 18px 0 8px; color: #44403c; }
+  .lede, .muted { color: var(--muted); font-size: 0.9rem; }
+  .nav a { color: #1e40af; margin-right: 12px; font-size: 0.88rem; }
+  .legend {
+    display: flex; flex-wrap: wrap; gap: 12px; padding: 12px 14px;
+    background: var(--card); border: 1px solid #d6d0c4; border-radius: 10px; margin: 16px 0; font-size: 0.82rem;
+  }
+  .legend i { display: inline-block; width: 18px; height: 18px; border: 1px solid var(--line); border-radius: 3px; vertical-align: middle; margin-right: 4px; }
+  .box { background: var(--card); border: 1px solid #d6d0c4; border-radius: 10px; padding: 14px 16px; margin: 14px 0; }
+  .formula {
+    background: #1c1917; color: #fafaf9; font-family: var(--mono); font-size: 0.76rem;
+    line-height: 1.75; padding: 12px 14px; border-radius: 8px; margin: 10px 0;
+  }
+  .formula .dim { color: #a8a29e; font-size: 0.7rem; }
+  .comm {
+    border-radius: 10px; padding: 14px; margin: 16px 0; text-align: center; font-size: 0.9rem;
+  }
+  .comm-fsdp { background: var(--fsdp-comm); border: 2px dashed #2563eb; }
+  .comm-tp { background: var(--tp-comm); border: 2px dashed #db2777; }
+  /* 2×4 GPU 网格 */
+  .mesh-wrap { overflow-x: auto; margin: 16px 0; }
+  .mesh {
+    display: grid;
+    grid-template-columns: 52px repeat(4, 1fr);
+    grid-template-rows: 36px repeat(2, 1fr);
+    gap: 10px;
+    min-width: 720px;
+    align-items: stretch;
+  }
+  .mesh-corner { }
+  .mesh-col-h {
+    text-align: center; font-size: 0.78rem; font-weight: 700; color: #1d4ed8;
+    display: flex; align-items: center; justify-content: center; flex-direction: column;
+  }
+  .mesh-row-h {
+    writing-mode: vertical-rl; transform: rotate(180deg);
+    text-align: center; font-size: 0.78rem; font-weight: 700; color: #be185d;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .gpu-cell {
+    background: var(--card); border: 2px solid #d6d0c4; border-radius: 10px;
+    padding: 8px 6px; text-align: center; min-height: 100px;
+  }
+  .gpu-cell .name { font-weight: 700; font-size: 0.82rem; margin-bottom: 4px; }
+  .gpu-cell .tag { font-size: 0.68rem; color: var(--muted); line-height: 1.35; }
+  .gpu-cell.tp0 { border-top-color: #be185d; border-top-width: 3px; }
+  .gpu-cell.tp1 { border-top-color: #9d174d; border-top-width: 3px; }
+  .arrow-h {
+    grid-column: 2 / 6; text-align: center; color: #2563eb; font-size: 0.85rem;
+    padding: 4px 0; font-weight: 600;
+  }
+  .arrow-v-note {
+    float: right; width: 28px; margin-left: 8px; color: #db2777; font-size: 0.75rem;
+    writing-mode: vertical-rl; text-align: center; font-weight: 600;
+  }
+  table.blk {
+    border-collapse: collapse; font-family: var(--mono); font-size: 0.62rem; margin: 4px auto;
+  }
+  table.blk td, table.blk th {
+    border: 1.2px solid var(--line); text-align: center; padding: 0;
+  }
+  table.blk th { background: #fafaf9; color: var(--muted); font-weight: 600; font-size: 0.55rem; }
+  .wt { background: var(--weight); }
+  .wl { background: var(--w-left); }
+  .wr { background: var(--w-right); }
+  .nf { background: var(--narrow-full); }
+  .np { background: var(--narrow-part); }
+  .ba { background: var(--batch); }
+  .w1 td { width: 14px; height: 14px; }
+  .w3 td { width: 14px; height: 14px; }
+  .vec td { width: 16px; height: 18px; font-size: 0.55rem; }
+  .wide td { width: 14px; height: 18px; }
+  .flow {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 8px; margin: 12px 0;
+  }
+  .flow .step {
+    background: var(--card); border: 1px solid #d6d0c4; border-radius: 8px; padding: 8px 12px;
+    font-size: 0.82rem; max-width: 200px; text-align: center;
+  }
+  .flow .arr { font-size: 1.2rem; color: #78716c; font-weight: 700; }
+  .vs { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 760px) { .vs { grid-template-columns: 1fr; } .mesh { min-width: 560px; } }
+  .axis-diagram {
+    font-family: var(--mono); font-size: 0.72rem; background: #292524; color: #e7e5e4;
+    padding: 14px; border-radius: 8px; line-height: 1.6; white-space: pre; overflow-x: auto;
+  }
+  .highlight { background: #fef08a; padding: 0 3px; border-radius: 2px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>FSDP + TP · 单层 FFN · 2×4 = 8 GPU</h1>
+<p class="lede">
+  <strong>竖向 = TP（怎么算）</strong>，2 行 · <strong>横向 = FSDP（怎么存 + batch）</strong>，4 列。
+  不用抽象的 i/j：记 <strong>TP 行 R0/R1</strong>、<strong>FSDP 列 C0–C3</strong>，卡名 <strong>R0C0</strong> … <strong>R1C3</strong>。
+  小 FFN：D=4（窄维 A B C D），D<sub>FF</sub>=8（宽维 w0–w7），B=8（每列 batch=2）。
+</p>
+
+<nav class="nav">
+  <a href="#mesh">8 卡网格</a>
+  <a href="#shard">权重怎么切</a>
+  <a href="#fwd">前向</a>
+  <a href="#bwd">反向</a>
+  <a href="#cheat">对照表</a>
+</nav>
+
+<!-- ===== 设定 ===== -->
+<h2 id="mesh">1 · 8 张卡排成 2×4</h2>
+<div class="box">
+  <div class="axis-diagram">                    C0        C1        C2        C3     ← FSDP 横轴（列）
+                 列内 all-gather 拼权重 · 列内 batch 相同 x⁽ᶜ⁾
+              ┌─────────┬─────────┬─────────┬─────────┐
+     TP 行 R0 │  R0C0   │  R0C1   │  R0C2   │  R0C3   │  负责 W 的「宽维左半 w0–w3」
+     （竖向） ├─────────┼─────────┼─────────┼─────────┤
+     TP 行 R1 │  R1C0   │  R1C1   │  R1C2   │  R1C3   │  负责 W 的「宽维右半 w4–w7」
+              └─────────┴─────────┴─────────┴─────────┘
+                    ↑         ↑         ↑         ↑
+              同一列内竖向 all-reduce（汇总 y 或 dx）</div>
+  <p class="muted" style="margin-top:10px">
+    <strong>All-gather</strong>：固定 TP 行，沿<strong>横排</strong>把权重行块拼成「这一 TP 行的完整子矩阵」。<br>
+    <strong>All-reduce</strong>：固定 FSDP 列，沿<strong>竖排</strong>把 R0 与 R1 的 partial 加起来。
+  </p>
+</div>
+
+<div class="mesh-wrap">
+  <div class="mesh">
+    <div class="mesh-corner"></div>
+    <div class="mesh-col-h">C0<br><span style="font-weight:400;font-size:0.65rem">FSDP</span></div>
+    <div class="mesh-col-h">C1</div>
+    <div class="mesh-col-h">C2</div>
+    <div class="mesh-col-h">C3</div>
+
+    <div class="mesh-row-h">R0 · TP<br>宽 w0–w3</div>
+    <div class="gpu-cell tp0"><div class="name">R0C0</div><div class="tag">常驻 W 行 A<br>batch 槽 0–1</div></div>
+    <div class="gpu-cell tp0"><div class="name">R0C1</div><div class="tag">常驻 W 行 B</div></div>
+    <div class="gpu-cell tp0"><div class="name">R0C2</div><div class="tag">常驻 W 行 C</div></div>
+    <div class="gpu-cell tp0"><div class="name">R0C3</div><div class="tag">常驻 W 行 D</div></div>
+
+    <div class="mesh-row-h">R1 · TP<br>宽 w4–w7</div>
+    <div class="gpu-cell tp1"><div class="name">R1C0</div><div class="tag">常驻 W 行 A<br>batch 槽 0–1</div></div>
+    <div class="gpu-cell tp1"><div class="name">R1C1</div><div class="tag">常驻 W 行 B</div></div>
+    <div class="gpu-cell tp1"><div class="name">R1C2</div><div class="tag">常驻 W 行 C</div></div>
+    <div class="gpu-cell tp1"><div class="name">R1C3</div><div class="tag">常驻 W 行 D</div></div>
+  </div>
+</div>
+
+<div class="legend">
+  <span><i style="background:var(--w-left)"></i> TP 行 R0 · 宽维 w0–w3</span>
+  <span><i style="background:var(--w-right)"></i> TP 行 R1 · 宽维 w4–w7</span>
+  <span><i style="background:var(--weight)"></i> 权重 W / dW</span>
+  <span><i style="background:var(--batch)"></i> 输入 x（按列切 batch）</span>
+  <span><i style="background:var(--narrow-part)"></i> y 的部分和（All-Reduce 前）</span>
+  <span><i style="background:var(--narrow-full)"></i> y / dy / dx（All-Reduce 后）</span>
+</div>
+
+<!-- ===== 切分 ===== -->
+<h2 id="shard">2 · 全球权重 vs 每张卡常驻哪一块</h2>
+<p class="muted">TP 切<strong>宽维</strong>（列/行怎么算）；FSDP 切 TP 没切的那条边（W1/W2 切<strong>窄维行</strong>，W3 切<strong>窄维列</strong>）。</p>
+
+<div class="vs">
+  <div class="box">
+    <p><strong>W1、W2</strong> &nbsp; 全球 4×8 &nbsp; 列并行（宽）+ 行分片（FSDP）</p>
+    <table class="blk">
+      <tr><th></th><th>w0</th><th>w1</th><th>w2</th><th>w3</th><th>w4</th><th>w5</th><th>w6</th><th>w7</th></tr>
+      <tr><th>A</th><td class="wl"></td><td class="wl"></td><td class="wl"></td><td class="wl"></td><td class="wr"></td><td class="wr"></td><td class="wr"></td><td class="wr"></td></tr>
+      <tr><th>B</th><td class="wl"></td><td class="wl"></td><td class="wl"></td><td class="wl"></td><td class="wr"></td><td class="wr"></td><td class="wr"></td><td class="wr"></td></tr>
+      <tr><th>C</th><td class="wl"></td><td class="wl"></td><td class="wl"></td><td class="wl"></td><td class="wr"></td><td class="wr"></td><td class="wr"></td><td class="wr"></td></tr>
+      <tr><th>D</th><td class="wl"></td><td class="wl"></td><td class="wl"></td><td class="wl"></td><td class="wr"></td><td class="wr"></td><td class="wr"></td><td class="wr"></td></tr>
+    </table>
+    <p class="muted" style="margin-top:8px">
+      <strong>R0C2</strong> 只存行 C + 列 w0–w3 → 形状 <strong>1×4</strong><br>
+      横排 R0C0–R0C3 拼起来 → <strong>4×4</strong>（不是全球 4×8）
+    </p>
+  </div>
+  <div class="box">
+    <p><strong>W3</strong> &nbsp; 全球 8×4 &nbsp; 行并行（宽）+ 列分片（FSDP）</p>
+    <table class="blk">
+      <tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th>w0</th><td class="wl"></td><td class="wl"></td><td class="wl"></td><td class="wl"></td></tr>
+      <tr><th>w1</th><td class="wl"></td><td class="wl"></td><td class="wl"></td><td class="wl"></td></tr>
+      <tr><th>w2</th><td class="wl"></td><td class="wl"></td><td class="wl"></td><td class="wl"></td></tr>
+      <tr><th>w3</th><td class="wl"></td><td class="wl"></td><td class="wl"></td><td class="wl"></td></tr>
+      <tr><th>w4</th><td class="wr"></td><td class="wr"></td><td class="wr"></td><td class="wr"></td></tr>
+      <tr><th>w5</th><td class="wr"></td><td class="wr"></td><td class="wr"></td><td class="wr"></td></tr>
+      <tr><th>w6</th><td class="wr"></td><td class="wr"></td><td class="wr"></td><td class="wr"></td></tr>
+      <tr><th>w7</th><td class="wr"></td><td class="wr"></td><td class="wr"></td><td class="wr"></td></tr>
+    </table>
+    <p class="muted" style="margin-top:8px">
+      <strong>R1C1</strong> 只存行 w4–w7 + 列 B → 形状 <strong>4×1</strong><br>
+      横排拼成 R1 的 W3 → <strong>4×4</strong>
+    </p>
+  </div>
+</div>
+
+<!-- ===== 前向 ===== -->
+<h2 id="fwd">3 · 前向（通信 + 本地算）</h2>
+
+<h3>Step A · FSDP 横轴：All-Gather 权重（不是拼全球 W）</h3>
+<div class="comm comm-fsdp">
+  <strong>沿横排</strong>（同一 TP 行 R0 或 R1）· 传 <strong>权重分片</strong> · All-Gather<br>
+  例：R0 行 · R0C0…R0C3 各出 1×4 → gather 后<strong>每卡</strong>都有完整 <strong>W1⁽ᴿ⁰⁾ 4×4</strong>（仅 w0–w3 那半宽）
+</div>
+<div class="flow">
+  <div class="step">R0C0<br><table class="blk w1"><tr><td class="wl"></td><td class="wl"></td><td class="wl"></td><td class="wl"></td></tr></table>1×4</div>
+  <div class="arr">+</div>
+  <div class="step">R0C1<br>1×4</div>
+  <div class="arr">+</div>
+  <div class="step">R0C2<br>1×4</div>
+  <div class="arr">+</div>
+  <div class="step">R0C3<br>1×4</div>
+  <div class="arr">⇒</div>
+  <div class="step"><strong>每卡</strong><br><table class="blk w1"><tr><td class="wl"></td><td class="wl"></td><td class="wl"></td><td class="wl"></td></tr><tr><td class="wl"></td><td class="wl"></td><td class="wl"></td><td class="wl"></td></tr><tr><td class="wl"></td><td class="wl"></td><td class="wl"></td><td class="wl"></td></tr><tr><td class="wl"></td><td class="wl"></td><td class="wl"></td><td class="wl"></td></tr></table>4×4</div>
+</div>
+<p class="muted">W2、W3 同理各 gather 一次。R1 横排单独 gather 右半宽。</p>
+
+<h3>Step B · 本地 matmul（与纯 TP 相同，batch 按列切）</h3>
+<div class="formula">
+  列 C2 上所有卡共享 x⁽ᶜ²⁾，形状 (2×4) &nbsp;<span class="dim">// B/N_FSDP=2，窄维 D=4 完整</span><br><br>
+  R0C2: &nbsp; x1 = x⁽ᶜ²⁾·W1⁽ᴿ⁰⁾ &nbsp;→ (2×4)·(4×4) = (2×4) 宽块 w0–w3<br>
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; z = f(x1)⊙x2 &nbsp;→ (2×4)<br>
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; y_partial = z·W3⁽ᴿ⁰⁾ &nbsp;→ (2×4)·(4×4) = <span class="highlight">(2×4) 部分和</span><br><br>
+  R1C2: &nbsp; 同上，但 W 是 R1 的 w4–w7 半宽 → 也得到 (2×4) <span class="highlight">部分和</span>
+</div>
+
+<div class="vs">
+  <div class="box" style="text-align:center">
+    <p><strong>R0C2</strong> 算完 · y 部分和</p>
+    <table class="blk vec"><tr><td class="np">·</td><td class="np">·</td><td class="np">·</td><td class="np">·</td></tr><tr><td class="np">·</td><td class="np">·</td><td class="np">·</td><td class="np">·</td></tr></table>
+    <p class="muted">2×4 · 来自 w0–w3 半宽</p>
+  </div>
+  <div class="box" style="text-align:center">
+    <p><strong>R1C2</strong> 算完 · y 部分和</p>
+    <table class="blk vec"><tr><td class="np">·</td><td class="np">·</td><td class="np">·</td><td class="np">·</td></tr><tr><td class="np">·</td><td class="np">·</td><td class="np">·</td><td class="np">·</td></tr></table>
+    <p class="muted">2×4 · 来自 w4–w7 半宽</p>
+  </div>
+</div>
+
+<h3>Step C · TP 竖轴：All-Reduce 激活 y</h3>
+<div class="comm comm-tp">
+  <strong>沿竖排</strong>（同一 FSDP 列，如 C2）· 传 <strong>激活 y</strong> · All-Reduce（求和）<br>
+  R0C2 的部分和 + R1C2 的部分和 → <strong>R0C2 与 R1C2 都得到完整 y⁽ᶜ²⁾ (2×4)</strong>
+</div>
+<div class="flow">
+  <div class="step">R0C2<br>y partial<br>2×4</div>
+  <div class="arr">+</div>
+  <div class="step">R1C2<br>y partial<br>2×4</div>
+  <div class="arr">⇒</div>
+  <div class="step">R0C2 &amp; R1C2<br><strong>同一</strong> y⁽ᶜ²⁾<br>2×4 完整</div>
+</div>
+
+<p class="muted"><strong>前向通信小结：</strong> 横轴 3× All-Gather（W1,W2,W3 的 TP 子矩阵）· 竖轴 1× All-Reduce（y）。两轴可 overlap → 墙钟 ≈ max(两者)。</p>
+
+<!-- ===== 反向 ===== -->
+<h2 id="bwd">4 · 反向（顺序与前向相反）</h2>
+
+<h3>Step D · 起点：dy 与 y 一样，按列已有完整副本</h3>
+<div class="box" style="text-align:center; max-width:280px; margin-left:auto; margin-right:auto">
+  <p><strong>列 C2</strong> · dy⁽ᶜ²⁾</p>
+  <table class="blk vec"><tr><td class="nf">·</td><td class="nf">·</td><td class="nf">·</td><td class="nf">·</td></tr><tr><td class="nf">·</td><td class="nf">·</td><td class="nf">·</td><td class="nf">·</td></tr></table>
+  <p class="muted">R0C2、R1C2 各拿同一份 dy → 本地算 dW、d z（宽块仍只覆盖半宽）</p>
+</div>
+
+<h3>Step E · TP 竖轴：All-Reduce dx（与前向 y 对称）</h3>
+<div class="comm comm-tp">
+  <strong>沿竖排</strong> · 传 <strong>输入梯度 dx</strong> · All-Reduce<br>
+  每 TP 行只贡献 dx 的一部分 → 竖向求和得完整 dx⁽ᶜ²⁾
+</div>
+<div class="formula">
+  R0C2: dx_local 来自 W1/W2 的 w0–w3 块 &nbsp;→ (2×4) partial<br>
+  R1C2: dx_local 来自 w4–w7 块 &nbsp;→ (2×4) partial<br>
+  All-Reduce 竖排 → 完整 dx⁽ᶜ²⁾ (2×4)
+</div>
+
+<h3>Step F · FSDP 横轴：Reduce-Scatter dW（不是 All-Reduce）</h3>
+<div class="comm comm-fsdp">
+  <strong>沿横排</strong> · 传 <strong>权重梯度 dW</strong> · Reduce-Scatter<br>
+  各卡先算 dW partial → <strong>求和后只留自己那一行/列块</strong>（optimizer 只更新本地分片）
+</div>
+<div class="flow">
+  <div class="step">四卡 partial<br>dW 4×4</div>
+  <div class="arr">⇒</div>
+  <div class="step">R0C0 只留<br>行 A · 1×4</div>
+  <div class="step">R0C1 只留<br>行 B</div>
+  <div class="step">…</div>
+</div>
+<p class="muted">dW1、dW2、dW3 各 scatter 一次。拼的是 <strong>TP 子矩阵上的梯度</strong>，不是全球 dW。</p>
+
+<p class="muted"><strong>反向通信小结：</strong> 竖轴 1× All-Reduce（dx）· 横轴 3× Reduce-Scatter（dW1,dW2,dW3）。</p>
+
+<!-- ===== 单卡故事 ===== -->
+<h2>5 · 单卡故事：R0C2 一整层前向</h2>
+<div class="box">
+  <ol style="margin:0; padding-left:1.2rem; font-size:0.9rem;">
+    <li><strong>常驻</strong>：W1 行 C 的 w0–w3 块 (1×4)，batch 2 条样本。</li>
+    <li><strong>All-Gather 横排</strong>：与 R0C0,R0C1,R0C3 拼出 W1⁽ᴿ⁰⁾ (4×4)。</li>
+    <li><strong>算</strong>：x⁽ᶜ²⁾(2×4) · W1 → z · W3 → y_partial (2×4)。</li>
+    <li><strong>All-Reduce 竖排</strong>：与 R1C2 加 y → 完整 y⁽ᶜ²⁾。</li>
+    <li>反向：dy → 本地 dW → <strong>竖 reduce dx</strong> → <strong>横 scatter dW</strong> → 仍只存行 C 那块。</li>
+  </ol>
+</div>
+
+<!-- ===== 对照 ===== -->
+<h2 id="cheat">6 · 一张表记住谁传什么</h2>
+<table class="blk" style="font-size:0.78rem; width:100%; max-width:720px; margin:0 auto;">
+  <tr>
+    <th style="padding:6px">阶段</th>
+    <th style="padding:6px">沿哪根轴</th>
+    <th style="padding:6px">Collective</th>
+    <th style="padding:6px">传什么</th>
+    <th style="padding:6px">不传什么</th>
+  </tr>
+  <tr>
+    <td style="padding:6px">前向</td>
+    <td style="padding:6px;color:#1d4ed8">横 · FSDP</td>
+    <td style="padding:6px">All-Gather</td>
+    <td style="padding:6px">W1,W2,W3 的 <strong>TP 子矩阵</strong></td>
+    <td style="padding:6px">全球完整 W · 激活</td>
+  </tr>
+  <tr>
+    <td style="padding:6px">前向</td>
+    <td style="padding:6px;color:#be185d">竖 · TP</td>
+    <td style="padding:6px">All-Reduce</td>
+    <td style="padding:6px">y 激活 (2×4)</td>
+    <td style="padding:6px">权重</td>
+  </tr>
+  <tr>
+    <td style="padding:6px">反向</td>
+    <td style="padding:6px;color:#be185d">竖 · TP</td>
+    <td style="padding:6px">All-Reduce</td>
+    <td style="padding:6px">dx (2×4)</td>
+    <td style="padding:6px">dW</td>
+  </tr>
+  <tr>
+    <td style="padding:6px">反向</td>
+    <td style="padding:6px;color:#1d4ed8">横 · FSDP</td>
+    <td style="padding:6px">Reduce-Scatter</td>
+    <td style="padding:6px">dW1,dW2,dW3 的 TP 子梯度</td>
+    <td style="padding:6px">完整 dW 副本</td>
+  </tr>
+</table>
+
+<p class="muted" style="margin-top:24px">
+  配套推导：<code>reports/fsdp-tp-calculations.md</code> · 纯 TP：<code>misc/misc-tp-ffn-simple.html</code>
+</p>
+
+</div>
+</body>
+</html>

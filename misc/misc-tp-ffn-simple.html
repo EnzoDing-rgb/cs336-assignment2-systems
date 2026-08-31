@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Tensor Parallel FFN · 4 GPU · 形状图</title>
+<style>
+  :root {
+    --bg: #f6f4ef;
+    --ink: #1c1917;
+    --muted: #6b6560;
+    --line: #a8a29e;
+    --card: #fffdf8;
+    /* 权重 W / dW —— W1 W2 W3 及 dW1 dW2 dW3 全文同色 */
+    --weight: #c9b896;
+    /* 宽维激活 z h dz dx1 dx2 —— 按分片 E F G H 着色 */
+    --e: #bfdbfe;
+    --f: #93c5fd;
+    --g: #60a5fa;
+    --h: #2563eb;
+    /* 窄维 A B C D */
+    --narrow-full: #fef9c3;   /* 每 GPU 完整副本：x, y, dy, dx（All-Reduce 后） */
+    --narrow-part: #ffedd5;    /* 每 GPU 部分和：y⁽ⁱ⁾, dx⁽ⁱ⁾_local */
+    --empty: #f5f5f4;
+    --mono: "IBM Plex Mono", "SF Mono", ui-monospace, monospace;
+    --sans: "IBM Plex Sans", "Noto Sans SC", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: var(--sans); color: var(--ink); background: var(--bg); line-height: 1.5; font-size: 15px; }
+  .wrap { max-width: 1000px; margin: 0 auto; padding: 28px 16px 64px; }
+  h1 { font-size: 1.5rem; margin: 0 0 8px; }
+  h2 { font-size: 1.15rem; margin: 32px 0 12px; padding-top: 12px; border-top: 2px solid #d6d0c4; }
+  h3 { font-size: 0.95rem; margin: 20px 0 8px; color: #44403c; }
+  .lede, .muted { color: var(--muted); font-size: 0.9rem; }
+  .nav a { color: #1e40af; margin-right: 12px; font-size: 0.88rem; }
+  .legend {
+    display: flex; flex-wrap: wrap; gap: 14px; padding: 12px 14px;
+    background: var(--card); border: 1px solid #d6d0c4; border-radius: 10px; margin: 16px 0;
+    font-size: 0.82rem;
+  }
+  .legend i { display: inline-block; width: 20px; height: 20px; border: 1px solid var(--line); border-radius: 3px; vertical-align: middle; margin-right: 4px; }
+  .gpu-row {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+    margin: 14px 0;
+  }
+  @media (max-width: 760px) { .gpu-row { grid-template-columns: 1fr 1fr; } }
+  .gpu-panel {
+    background: var(--card);
+    border: 2px solid #d6d0c4;
+    border-radius: 10px;
+    padding: 10px 8px 14px;
+    text-align: center;
+  }
+  .gpu-panel h4 {
+    margin: 0 0 10px;
+    font-size: 0.85rem;
+    font-weight: 700;
+    color: var(--ink);
+    border-bottom: 1px solid #e7e5e4;
+    padding-bottom: 6px;
+  }
+  .gpu-panel .shard-tag { font-size: 0.72rem; color: var(--muted); font-weight: 400; }
+  .shape-name {
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    color: var(--muted);
+    margin: 6px 0 2px;
+  }
+  .arrow { text-align: center; color: #78716c; font-size: 1.1rem; margin: 4px 0; font-weight: 700; }
+  .comm {
+    background: #fef3c7;
+    border: 2px dashed #d97706;
+    border-radius: 10px;
+    padding: 12px;
+    margin: 16px 0;
+    text-align: center;
+    font-size: 0.9rem;
+  }
+  /* 矩阵块 */
+  .blk-wrap { display: flex; justify-content: center; align-items: flex-end; gap: 4px; flex-wrap: wrap; }
+  table.blk {
+    border-collapse: collapse;
+    font-family: var(--mono);
+    font-size: 0.65rem;
+  }
+  table.blk td, table.blk th {
+    border: 1.5px solid var(--line);
+    text-align: center;
+    vertical-align: middle;
+    padding: 0;
+  }
+  table.blk th { background: #fafaf9; color: var(--muted); font-weight: 600; }
+  /* 尺寸：按相对比例，不是像素精确 */
+  .w1 td { width: 28px; height: 22px; }      /* 4×1 */
+  .w3 td { width: 22px; height: 22px; }      /* 1×4 */
+  .vec td { width: 26px; height: 24px; }     /* 1×4 窄向量 */
+  .wide td { width: 22px; height: 24px; }     /* 1×(D_FF/N) 宽向量，本例 1×1 */
+  .wide2 td { width: 22px; height: 24px; }    /* 1×2 示例 */
+  .wt { background: var(--weight); }          /* 所有权重块 */
+  .e { background: var(--e); }                 /* 宽维激活 · 分片 E */
+  .f { background: var(--f); }
+  .g { background: var(--g); }
+  .h { background: var(--h); }
+  .nf { background: var(--narrow-full); }
+  .np { background: var(--narrow-part); }
+  .em { background: var(--empty); color: #d6d3d1; }
+  .vs { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 700px) { .vs { grid-template-columns: 1fr; } }
+  .full-map { text-align: center; }
+  .full-map table.blk td { width: 36px; height: 36px; }
+  .sum-line {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 8px; margin: 12px 0;
+  }
+  .sum-line .plus { font-size: 1.3rem; font-weight: 700; color: #78716c; }
+  .box { background: var(--card); border: 1px solid #d6d0c4; border-radius: 10px; padding: 12px 14px; margin: 12px 0; }
+  .mul { font-family: var(--mono); font-size: 0.75rem; color: #78716c; }
+  .formula {
+    background: #1c1917;
+    color: #fafaf9;
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    line-height: 1.7;
+    padding: 10px 12px;
+    border-radius: 8px;
+    margin: 8px 0 12px;
+    text-align: left;
+  }
+  .formula .dim { color: #a8a29e; font-size: 0.72rem; }
+  .gpu-panel .formula { font-size: 0.68rem; padding: 8px; margin: 6px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Tensor Parallel FFN · 按 GPU 看形状</h1>
+<p class="lede">
+  N<sub>TP</sub>=4。窄维 D=4（A B C D），宽维 D<sub>FF</sub>=4（E F G H）。本例每卡宽维块大小 = D<sub>FF</sub>/N = 1，所以 z、dz 等是 <strong>1×1 矩阵</strong>（不是「标量」——若 D<sub>FF</sub>=8 则同位置是 1×2 块）。
+  一切从 <strong>GPU 0 / 1 / 2 / 3</strong> 出发：图上画的就是该卡本地内存里的张量形状。
+</p>
+
+<nav class="nav">
+  <a href="#legend">颜色</a>
+  <a href="#weights">权重切分</a>
+  <a href="#fwd">前向</a>
+  <a href="#ar-y">All-Reduce y</a>
+  <a href="#bwd">反向</a>
+  <a href="#ar-dx">All-Reduce dx</a>
+</nav>
+
+<!-- ===== 颜色 ===== -->
+<h2 id="legend">颜色（全文统一）</h2>
+<div class="legend">
+  <span><i style="background:var(--weight)"></i> <strong>权重</strong> W1 / W2 / W3 / dW1 / dW2 / dW3（全文同色）</span>
+  <span><i style="background:var(--e)"></i> 宽维激活 <strong>E</strong> → GPU 0（z、dz、dx1、dx2）</span>
+  <span><i style="background:var(--f)"></i> 宽维激活 <strong>F</strong> → GPU 1</span>
+  <span><i style="background:var(--g)"></i> 宽维激活 <strong>G</strong> → GPU 2</span>
+  <span><i style="background:var(--h)"></i> 宽维激活 <strong>H</strong> → GPU 3</span>
+  <span><i style="background:var(--narrow-full)"></i> 窄维 <strong>完整</strong> 1×4（x；All-Reduce 后的 y / dy / dx）</span>
+  <span><i style="background:var(--narrow-part)"></i> 窄维 <strong>部分和</strong> 1×4（y⁽ⁱ⁾、dx⁽ⁱ⁾_local）</span>
+</div>
+<p class="muted">同色 = 同一类东西。权重不分色；宽维<strong>激活</strong>才按 E/F/G/H 分色。哪块权重归哪张 GPU，看形状位置 + 面板标题，不看权重颜色。</p>
+
+<!-- ===== 权重 ===== -->
+<h2 id="weights">完整权重 + 每 GPU 拿哪一块</h2>
+<div class="vs">
+  <div class="box full-map">
+    <p><strong>W1、W2</strong> &nbsp; 形状 4×4 &nbsp; 列并行</p>
+    <table class="blk">
+      <tr><th></th><th>E<br><span style="font-weight:400;font-size:0.6rem">GPU0</span></th><th>F<br><span style="font-weight:400;font-size:0.6rem">GPU1</span></th><th>G<br><span style="font-weight:400;font-size:0.6rem">GPU2</span></th><th>H<br><span style="font-weight:400;font-size:0.6rem">GPU3</span></th></tr>
+      <tr><th>A</th><td class="wt"></td><td class="wt"></td><td class="wt"></td><td class="wt"></td></tr>
+      <tr><th>B</th><td class="wt"></td><td class="wt"></td><td class="wt"></td><td class="wt"></td></tr>
+      <tr><th>C</th><td class="wt"></td><td class="wt"></td><td class="wt"></td><td class="wt"></td></tr>
+      <tr><th>D</th><td class="wt"></td><td class="wt"></td><td class="wt"></td><td class="wt"></td></tr>
+    </table>
+    <p class="muted">GPU 0→列 E · GPU 1→列 F · GPU 2→列 G · GPU 3→列 H<br>每卡 W1⁽ⁱ⁾、W2⁽ⁱ⁾ 形状 <strong>4×1</strong></p>
+  </div>
+  <div class="box full-map">
+    <p><strong>W3</strong> &nbsp; 形状 4×4 &nbsp; 行并行（宽维行）</p>
+    <table class="blk">
+      <tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th>E<br><span style="font-weight:400;font-size:0.6rem">GPU0</span></th><td class="wt"></td><td class="wt"></td><td class="wt"></td><td class="wt"></td></tr>
+      <tr><th>F<br><span style="font-weight:400;font-size:0.6rem">GPU1</span></th><td class="wt"></td><td class="wt"></td><td class="wt"></td><td class="wt"></td></tr>
+      <tr><th>G<br><span style="font-weight:400;font-size:0.6rem">GPU2</span></th><td class="wt"></td><td class="wt"></td><td class="wt"></td><td class="wt"></td></tr>
+      <tr><th>H<br><span style="font-weight:400;font-size:0.6rem">GPU3</span></th><td class="wt"></td><td class="wt"></td><td class="wt"></td><td class="wt"></td></tr>
+    </table>
+    <p class="muted">GPU 0→行 E · GPU 1→行 F · GPU 2→行 G · GPU 3→行 H<br>每卡 W3⁽ⁱ⁾ 形状 <strong>1×4</strong></p>
+  </div>
+</div>
+
+<!-- ===== 前向 ===== -->
+<h2 id="fwd">前向 · 每张 GPU 本地有什么、算什么</h2>
+<p class="muted">Column（W1,W2）→ ⊙ → Row（W3）。中间宽激活不通信。下式中 i ∈ {0,1,2,3} 对应 GPU i。</p>
+<div class="formula">
+  h1⁽ⁱ⁾ = x · W1⁽ⁱ⁾ &nbsp;&nbsp;<span class="dim">// (1×4)·(4×1) → (1×1)</span><br>
+  h2⁽ⁱ⁾ = x · W2⁽ⁱ⁾ &nbsp;&nbsp;<span class="dim">// 同上</span><br>
+  z⁽ⁱ⁾ = h1⁽ⁱ⁾ ⊙ h2⁽ⁱ⁾ &nbsp;&nbsp;<span class="dim">// (1×1)，宽维第 i 块</span><br>
+  y⁽ⁱ⁾ = z⁽ⁱ⁾ · W3⁽ⁱ⁾ &nbsp;&nbsp;<span class="dim">// (1×1)·(1×4) → (1×4) 部分和</span>
+</div>
+
+<div class="gpu-row">
+  <!-- GPU 0 -->
+  <div class="gpu-panel">
+    <h4>GPU 0 <span class="shard-tag">· 宽维 E</span></h4>
+    <div class="formula">h1⁽⁰⁾=x·W1⁽⁰⁾<br>h2⁽⁰⁾=x·W2⁽⁰⁾<br>z⁽⁰⁾=h1⁽⁰⁾⊙h2⁽⁰⁾<br>y⁽⁰⁾=z⁽⁰⁾·W3⁽⁰⁾</div>
+    <div class="shape-name">x &nbsp; 1×4 · 完整</div>
+    <table class="blk vec"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th></th><td class="nf"></td><td class="nf"></td><td class="nf"></td><td class="nf"></td></tr></table>
+    <div class="arrow">×</div>
+    <div class="shape-name">W1⁽⁰⁾ W2⁽⁰⁾ &nbsp; 各 4×1</div>
+    <div class="blk-wrap">
+      <table class="blk w1"><tr><th></th><th>E</th></tr>
+        <tr><th>A</th><td class="wt"></td></tr><tr><th>B</th><td class="wt"></td></tr>
+        <tr><th>C</th><td class="wt"></td></tr><tr><th>D</th><td class="wt"></td></tr></table>
+      <table class="blk w1"><tr><th></th><th>E</th></tr>
+        <tr><th>A</th><td class="wt"></td></tr><tr><th>B</th><td class="wt"></td></tr>
+        <tr><th>C</th><td class="wt"></td></tr><tr><th>D</th><td class="wt"></td></tr></table>
+    </div>
+    <div class="arrow">→ h1⁽⁰⁾ h2⁽⁰⁾ &nbsp; 1×1 → ⊙</div>
+    <div class="shape-name">z⁽⁰⁾ &nbsp; 1×1</div>
+    <table class="blk wide"><tr><th></th><th>E</th></tr><tr><th></th><td class="e"></td></tr></table>
+    <div class="arrow">×</div>
+    <div class="shape-name">W3⁽⁰⁾ &nbsp; 1×4</div>
+    <table class="blk w3"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th>E</th><td class="wt"></td><td class="wt"></td><td class="wt"></td><td class="wt"></td></tr></table>
+    <div class="arrow">→</div>
+    <div class="shape-name">y⁽⁰⁾ &nbsp; 1×4 · 部分和</div>
+    <table class="blk vec"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th></th><td class="np"></td><td class="np"></td><td class="np"></td><td class="np"></td></tr></table>
+  </div>
+  <!-- GPU 1 -->
+  <div class="gpu-panel">
+    <h4>GPU 1 <span class="shard-tag">· 宽维 F</span></h4>
+    <div class="formula">h1⁽¹⁾=x·W1⁽¹⁾ … y⁽¹⁾=z⁽¹⁾·W3⁽¹⁾<br><span class="dim">// 结构同 GPU 0，i=1</span></div>
+    <div class="shape-name">x &nbsp; 1×4 · 完整</div>
+    <table class="blk vec"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th></th><td class="nf"></td><td class="nf"></td><td class="nf"></td><td class="nf"></td></tr></table>
+    <div class="arrow">× W1⁽¹⁾ W2⁽¹⁾ &nbsp; 4×1</div>
+    <table class="blk w1"><tr><th></th><th>F</th></tr>
+      <tr><th>A</th><td class="wt"></td></tr><tr><th>B</th><td class="wt"></td></tr>
+      <tr><th>C</th><td class="wt"></td></tr><tr><th>D</th><td class="wt"></td></tr></table>
+    <div class="arrow">→ z⁽¹⁾ &nbsp; 1×1 → × W3⁽¹⁾</div>
+    <table class="blk w3"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th>F</th><td class="wt"></td><td class="wt"></td><td class="wt"></td><td class="wt"></td></tr></table>
+    <div class="arrow">→</div>
+    <div class="shape-name">y⁽¹⁾ &nbsp; 1×4 · 部分和</div>
+    <table class="blk vec"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th></th><td class="np"></td><td class="np"></td><td class="np"></td><td class="np"></td></tr></table>
+  </div>
+  <!-- GPU 2 -->
+  <div class="gpu-panel">
+    <h4>GPU 2 <span class="shard-tag">· 宽维 G</span></h4>
+    <div class="formula">y⁽²⁾=z⁽²⁾·W3⁽²⁾ &nbsp;<span class="dim">// i=2</span></div>
+    <div class="shape-name">x &nbsp; 1×4 · 完整</div>
+    <table class="blk vec"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th></th><td class="nf"></td><td class="nf"></td><td class="nf"></td><td class="nf"></td></tr></table>
+    <div class="arrow">× W1⁽²⁾ W2⁽²⁾ → z⁽²⁾ → × W3⁽²⁾</div>
+    <table class="blk w1" style="margin:0 auto"><tr><th></th><th>G</th></tr>
+      <tr><th>A</th><td class="wt"></td></tr><tr><th>B</th><td class="wt"></td></tr>
+      <tr><th>C</th><td class="wt"></td></tr><tr><th>D</th><td class="wt"></td></tr></table>
+    <table class="blk w3" style="margin:6px auto 0"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th>G</th><td class="wt"></td><td class="wt"></td><td class="wt"></td><td class="wt"></td></tr></table>
+    <div class="arrow">→</div>
+    <div class="shape-name">y⁽²⁾ &nbsp; 1×4 · 部分和</div>
+    <table class="blk vec"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th></th><td class="np"></td><td class="np"></td><td class="np"></td><td class="np"></td></tr></table>
+  </div>
+  <!-- GPU 3 -->
+  <div class="gpu-panel">
+    <h4>GPU 3 <span class="shard-tag">· 宽维 H</span></h4>
+    <div class="formula">y⁽³⁾=z⁽³⁾·W3⁽³⁾ &nbsp;<span class="dim">// i=3</span></div>
+    <div class="shape-name">x &nbsp; 1×4 · 完整</div>
+    <table class="blk vec"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th></th><td class="nf"></td><td class="nf"></td><td class="nf"></td><td class="nf"></td></tr></table>
+    <div class="arrow">× W1⁽³⁾ W2⁽³⁾ → z⁽³⁾ → × W3⁽³⁾</div>
+    <table class="blk w1" style="margin:0 auto"><tr><th></th><th>H</th></tr>
+      <tr><th>A</th><td class="wt"></td></tr><tr><th>B</th><td class="wt"></td></tr>
+      <tr><th>C</th><td class="wt"></td></tr><tr><th>D</th><td class="wt"></td></tr></table>
+    <table class="blk w3" style="margin:6px auto 0"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th>H</th><td class="wt"></td><td class="wt"></td><td class="wt"></td><td class="wt"></td></tr></table>
+    <div class="arrow">→</div>
+    <div class="shape-name">y⁽³⁾ &nbsp; 1×4 · 部分和</div>
+    <table class="blk vec"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th></th><td class="np"></td><td class="np"></td><td class="np"></td><td class="np"></td></tr></table>
+  </div>
+</div>
+
+<!-- All-Reduce y -->
+<h2 id="ar-y">All-Reduce y · GPU 0 + GPU 1 + GPU 2 + GPU 3</h2>
+<div class="formula">
+  y = y⁽⁰⁾ + y⁽¹⁾ + y⁽²⁾ + y⁽³⁾ &nbsp;&nbsp;<span class="dim">// AllReduce(sum)；之后 GPU 0–3 上 y 相同，形状 (1×4)</span>
+</div>
+<div class="sum-line">
+  <div class="gpu-panel" style="min-width:120px">
+    <h4>GPU 0</h4>
+    <div class="shape-name">y⁽⁰⁾</div>
+    <table class="blk vec"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th></th><td class="np"></td><td class="np"></td><td class="np"></td><td class="np"></td></tr></table>
+  </div>
+  <span class="plus">+</span>
+  <div class="gpu-panel" style="min-width:120px">
+    <h4>GPU 1</h4>
+    <div class="shape-name">y⁽¹⁾</div>
+    <table class="blk vec"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th></th><td class="np"></td><td class="np"></td><td class="np"></td><td class="np"></td></tr></table>
+  </div>
+  <span class="plus">+</span>
+  <div class="gpu-panel" style="min-width:120px">
+    <h4>GPU 2</h4>
+    <div class="shape-name">y⁽²⁾</div>
+    <table class="blk vec"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th></th><td class="np"></td><td class="np"></td><td class="np"></td><td class="np"></td></tr></table>
+  </div>
+  <span class="plus">+</span>
+  <div class="gpu-panel" style="min-width:120px">
+    <h4>GPU 3</h4>
+    <div class="shape-name">y⁽³⁾</div>
+    <table class="blk vec"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th></th><td class="np"></td><td class="np"></td><td class="np"></td><td class="np"></td></tr></table>
+  </div>
+</div>
+<div class="comm">All-Reduce (sum) 后 ↓</div>
+<div class="gpu-row">
+  <div class="gpu-panel"><h4>GPU 0</h4><div class="shape-name">y &nbsp; 1×4</div>
+    <table class="blk vec"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th></th><td class="nf"></td><td class="nf"></td><td class="nf"></td><td class="nf"></td></tr></table></div>
+  <div class="gpu-panel"><h4>GPU 1</h4><div class="shape-name">y &nbsp; 1×4</div>
+    <table class="blk vec"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th></th><td class="nf"></td><td class="nf"></td><td class="nf"></td><td class="nf"></td></tr></table></div>
+  <div class="gpu-panel"><h4>GPU 2</h4><div class="shape-name">y &nbsp; 1×4</div>
+    <table class="blk vec"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th></th><td class="nf"></td><td class="nf"></td><td class="nf"></td><td class="nf"></td></tr></table></div>
+  <div class="gpu-panel"><h4>GPU 3</h4><div class="shape-name">y &nbsp; 1×4</div>
+    <table class="blk vec"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th></th><td class="nf"></td><td class="nf"></td><td class="nf"></td><td class="nf"></td></tr></table></div>
+</div>
+<p class="muted" style="text-align:center">四张 GPU 上的 y <strong>形状相同、数值相同</strong>（黄色）。前向唯一通信。</p>
+
+<!-- ===== 反向 ===== -->
+<h2 id="bwd">反向 · 每张 GPU（顺序：W3 → ⊙ → W1,W2）</h2>
+<div class="formula">
+  dy⁽ⁱ⁾ = dy<br>
+  dW3⁽ⁱ⁾ = (z⁽ⁱ⁾)<sup>T</sup> · dy &nbsp;;&nbsp; dz⁽ⁱ⁾ = dy · (W3⁽ⁱ⁾)<sup>T</sup><br>
+  dx1⁽ⁱ⁾ = dz⁽ⁱ⁾ ⊙ h2⁽ⁱ⁾ &nbsp;;&nbsp; dx2⁽ⁱ⁾ = dz⁽ⁱ⁾ ⊙ h1⁽ⁱ⁾<br>
+  dW1⁽ⁱ⁾ = x<sup>T</sup> · dx1⁽ⁱ⁾ &nbsp;;&nbsp; dW2⁽ⁱ⁾ = x<sup>T</sup> · dx2⁽ⁱ⁾<br>
+  dx⁽ⁱ⁾<sub>local</sub> = dx1⁽ⁱ⁾ · (W1⁽ⁱ⁾)<sup>T</sup> + dx2⁽ⁱ⁾ · (W2⁽ⁱ⁾)<sup>T</sup><br>
+  dx = Σ<sub>i</sub> dx⁽ⁱ⁾<sub>local</sub> &nbsp;&nbsp;<span class="dim">// AllReduce(sum)</span>
+</div>
+
+<h3>入口：dy — 与 y 同形，GPU 0–3 各一份相同副本</h3>
+<div class="formula">
+  dy⁽ⁱ⁾ = dy &nbsp;&nbsp;∀ i &nbsp;&nbsp;<span class="dim">// 前向 All-Reduce 后各卡 y 相同 → ∂L/∂y 在各卡相同；形状 (1×4)</span>
+</div>
+<div class="gpu-row">
+  <div class="gpu-panel"><h4>GPU 0</h4><div class="shape-name">dy &nbsp; 1×4</div>
+    <table class="blk vec"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th></th><td class="nf"></td><td class="nf"></td><td class="nf"></td><td class="nf"></td></tr></table></div>
+  <div class="gpu-panel"><h4>GPU 1</h4><div class="shape-name">dy &nbsp; 1×4</div>
+    <table class="blk vec"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th></th><td class="nf"></td><td class="nf"></td><td class="nf"></td><td class="nf"></td></tr></table></div>
+  <div class="gpu-panel"><h4>GPU 2</h4><div class="shape-name">dy &nbsp; 1×4</div>
+    <table class="blk vec"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th></th><td class="nf"></td><td class="nf"></td><td class="nf"></td><td class="nf"></td></tr></table></div>
+  <div class="gpu-panel"><h4>GPU 3</h4><div class="shape-name">dy &nbsp; 1×4</div>
+    <table class="blk vec"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th></th><td class="nf"></td><td class="nf"></td><td class="nf"></td><td class="nf"></td></tr></table></div>
+</div>
+
+<h3>Step 1 · Row / W3（无通信）</h3>
+<div class="formula">
+  dW3⁽ⁱ⁾ = (z⁽ⁱ⁾)<sup>T</sup> · dy &nbsp;&nbsp;<span class="dim">// (1×1)<sup>T</sup>·(1×4) → (1×4)，同 W3⁽ⁱ⁾</span><br>
+  dz⁽ⁱ⁾ = dy · (W3⁽ⁱ⁾)<sup>T</sup> &nbsp;&nbsp;<span class="dim">// (1×4)·(4×1) → (1×1)，宽维第 i 块</span>
+</div>
+<div class="gpu-row">
+  <div class="gpu-panel">
+    <h4>GPU 0</h4>
+    <div class="formula">dW3⁽⁰⁾=(z⁽⁰⁾)<sup>T</sup>·dy<br>dz⁽⁰⁾=dy·(W3⁽⁰⁾)<sup>T</sup></div>
+    <div class="shape-name">dW3⁽⁰⁾ &nbsp; 1×4（同 W3⁽⁰⁾）</div>
+    <table class="blk w3"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th>E</th><td class="wt"></td><td class="wt"></td><td class="wt"></td><td class="wt"></td></tr></table>
+    <div class="shape-name">dz⁽⁰⁾ &nbsp; 1×1</div>
+    <table class="blk wide"><tr><th></th><th>E</th></tr><tr><th></th><td class="e"></td></tr></table>
+  </div>
+  <div class="gpu-panel">
+    <h4>GPU 1</h4>
+    <div class="formula">dW3⁽¹⁾=(z⁽¹⁾)<sup>T</sup>·dy<br>dz⁽¹⁾=dy·(W3⁽¹⁾)<sup>T</sup></div>
+    <div class="shape-name">dW3⁽¹⁾ &nbsp; 1×4</div>
+    <table class="blk w3"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th>F</th><td class="wt"></td><td class="wt"></td><td class="wt"></td><td class="wt"></td></tr></table>
+    <div class="shape-name">dz⁽¹⁾ &nbsp; 1×1</div>
+    <table class="blk wide"><tr><th></th><th>F</th></tr><tr><th></th><td class="f"></td></tr></table>
+  </div>
+  <div class="gpu-panel">
+    <h4>GPU 2</h4>
+    <div class="formula">dW3⁽²⁾=(z⁽²⁾)<sup>T</sup>·dy<br>dz⁽²⁾=dy·(W3⁽²⁾)<sup>T</sup></div>
+    <div class="shape-name">dW3⁽²⁾ &nbsp; 1×4</div>
+    <table class="blk w3"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th>G</th><td class="wt"></td><td class="wt"></td><td class="wt"></td><td class="wt"></td></tr></table>
+    <div class="shape-name">dz⁽²⁾ &nbsp; 1×1</div>
+    <table class="blk wide"><tr><th></th><th>G</th></tr><tr><th></th><td class="g"></td></tr></table>
+  </div>
+  <div class="gpu-panel">
+    <h4>GPU 3</h4>
+    <div class="formula">dW3⁽³⁾=(z⁽³⁾)<sup>T</sup>·dy<br>dz⁽³⁾=dy·(W3⁽³⁾)<sup>T</sup></div>
+    <div class="shape-name">dW3⁽³⁾ &nbsp; 1×4</div>
+    <table class="blk w3"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th>H</th><td class="wt"></td><td class="wt"></td><td class="wt"></td><td class="wt"></td></tr></table>
+    <div class="shape-name">dz⁽³⁾ &nbsp; 1×1</div>
+    <table class="blk wide"><tr><th></th><th>H</th></tr><tr><th></th><td class="h"></td></tr></table>
+  </div>
+</div>
+
+<h3>Step 2 · ⊙ 反传（无通信）</h3>
+<div class="formula">
+  dx1⁽ⁱ⁾ = dz⁽ⁱ⁾ ⊙ h2⁽ⁱ⁾ &nbsp;&nbsp;<span class="dim">// (1×1)，链式法则（对应 z⁽ⁱ⁾ = h1⁽ⁱ⁾ ⊙ h2⁽ⁱ⁾）</span><br>
+  dx2⁽ⁱ⁾ = dz⁽ⁱ⁾ ⊙ h1⁽ⁱ⁾ &nbsp;&nbsp;<span class="dim">// (1×1)</span>
+</div>
+<div class="gpu-row">
+  <div class="gpu-panel"><h4>GPU 0</h4>
+    <div class="formula">dx1⁽⁰⁾=dz⁽⁰⁾⊙h2⁽⁰⁾<br>dx2⁽⁰⁾=dz⁽⁰⁾⊙h1⁽⁰⁾</div>
+    <div class="shape-name">dx1⁽⁰⁾ dx2⁽⁰⁾ &nbsp; 各 1×1</div>
+    <div class="blk-wrap">
+      <table class="blk wide"><tr><th></th><th>E</th></tr><tr><th></th><td class="e"></td></tr></table>
+      <table class="blk wide"><tr><th></th><th>E</th></tr><tr><th></th><td class="e"></td></tr></table>
+    </div></div>
+  <div class="gpu-panel"><h4>GPU 1</h4>
+    <div class="shape-name">dx1⁽¹⁾ dx2⁽¹⁾ &nbsp; 各 1×1</div>
+    <div class="blk-wrap">
+      <table class="blk wide"><tr><th></th><th>F</th></tr><tr><th></th><td class="f"></td></tr></table>
+      <table class="blk wide"><tr><th></th><th>F</th></tr><tr><th></th><td class="f"></td></tr></table>
+    </div></div>
+  <div class="gpu-panel"><h4>GPU 2</h4>
+    <div class="shape-name">dx1⁽²⁾ dx2⁽²⁾ &nbsp; 各 1×1</div>
+    <div class="blk-wrap">
+      <table class="blk wide"><tr><th></th><th>G</th></tr><tr><th></th><td class="g"></td></tr></table>
+      <table class="blk wide"><tr><th></th><th>G</th></tr><tr><th></th><td class="g"></td></tr></table>
+    </div></div>
+  <div class="gpu-panel"><h4>GPU 3</h4>
+    <div class="shape-name">dx1⁽³⁾ dx2⁽³⁾ &nbsp; 各 1×1</div>
+    <div class="blk-wrap">
+      <table class="blk wide"><tr><th></th><th>H</th></tr><tr><th></th><td class="h"></td></tr></table>
+      <table class="blk wide"><tr><th></th><th>H</th></tr><tr><th></th><td class="h"></td></tr></table>
+    </div></div>
+</div>
+
+<h3>Step 3 · Column / W1,W2（无通信，除最后 dx）</h3>
+<div class="formula">
+  dW1⁽ⁱ⁾ = x<sup>T</sup> · dx1⁽ⁱ⁾ &nbsp;&nbsp;<span class="dim">// (4×1)·(1×1) → (4×1)，同 W1⁽ⁱ⁾</span><br>
+  dW2⁽ⁱ⁾ = x<sup>T</sup> · dx2⁽ⁱ⁾ &nbsp;&nbsp;<span class="dim">// (4×1)</span><br>
+  dx⁽ⁱ⁾<sub>local</sub> = dx1⁽ⁱ⁾ · (W1⁽ⁱ⁾)<sup>T</sup> + dx2⁽ⁱ⁾ · (W2⁽ⁱ⁾)<sup>T</sup> &nbsp;&nbsp;<span class="dim">// → (1×4) 部分和</span>
+</div>
+<div class="gpu-row">
+  <div class="gpu-panel">
+    <h4>GPU 0</h4>
+    <div class="shape-name">dW1⁽⁰⁾ dW2⁽⁰⁾ &nbsp; 各 4×1（同 W1⁽⁰⁾）</div>
+    <div class="blk-wrap">
+      <table class="blk w1"><tr><th></th><th>E</th></tr>
+        <tr><th>A</th><td class="wt"></td></tr><tr><th>B</th><td class="wt"></td></tr>
+        <tr><th>C</th><td class="wt"></td></tr><tr><th>D</th><td class="wt"></td></tr></table>
+      <table class="blk w1"><tr><th></th><th>E</th></tr>
+        <tr><th>A</th><td class="wt"></td></tr><tr><th>B</th><td class="wt"></td></tr>
+        <tr><th>C</th><td class="wt"></td></tr><tr><th>D</th><td class="wt"></td></tr></table>
+    </div>
+    <div class="shape-name">dx⁽⁰⁾_local &nbsp; 1×4 · 部分和</div>
+    <table class="blk vec"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th></th><td class="np"></td><td class="np"></td><td class="np"></td><td class="np"></td></tr></table>
+  </div>
+  <div class="gpu-panel">
+    <h4>GPU 1</h4>
+    <div class="shape-name">dW1⁽¹⁾ dW2⁽¹⁾ &nbsp; 4×1</div>
+    <table class="blk w1" style="margin:0 auto"><tr><th></th><th>F</th></tr>
+      <tr><th>A</th><td class="wt"></td></tr><tr><th>B</th><td class="wt"></td></tr>
+      <tr><th>C</th><td class="wt"></td></tr><tr><th>D</th><td class="wt"></td></tr></table>
+    <div class="shape-name">dx⁽¹⁾_local &nbsp; 1×4</div>
+    <table class="blk vec"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th></th><td class="np"></td><td class="np"></td><td class="np"></td><td class="np"></td></tr></table>
+  </div>
+  <div class="gpu-panel">
+    <h4>GPU 2</h4>
+    <div class="shape-name">dW1⁽²⁾ dW2⁽²⁾ &nbsp; 4×1</div>
+    <table class="blk w1" style="margin:0 auto"><tr><th></th><th>G</th></tr>
+      <tr><th>A</th><td class="wt"></td></tr><tr><th>B</th><td class="wt"></td></tr>
+      <tr><th>C</th><td class="wt"></td></tr><tr><th>D</th><td class="wt"></td></tr></table>
+    <div class="shape-name">dx⁽²⁾_local &nbsp; 1×4</div>
+    <table class="blk vec"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th></th><td class="np"></td><td class="np"></td><td class="np"></td><td class="np"></td></tr></table>
+  </div>
+  <div class="gpu-panel">
+    <h4>GPU 3</h4>
+    <div class="shape-name">dW1⁽³⁾ dW2⁽³⁾ &nbsp; 4×1</div>
+    <table class="blk w1" style="margin:0 auto"><tr><th></th><th>H</th></tr>
+      <tr><th>A</th><td class="wt"></td></tr><tr><th>B</th><td class="wt"></td></tr>
+      <tr><th>C</th><td class="wt"></td></tr><tr><th>D</th><td class="wt"></td></tr></table>
+    <div class="shape-name">dx⁽³⁾_local &nbsp; 1×4</div>
+    <table class="blk vec"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th></th><td class="np"></td><td class="np"></td><td class="np"></td><td class="np"></td></tr></table>
+  </div>
+</div>
+
+<!-- All-Reduce dx -->
+<h2 id="ar-dx">All-Reduce dx · GPU 0 + GPU 1 + GPU 2 + GPU 3</h2>
+<div class="formula">
+  dx = dx⁽⁰⁾<sub>local</sub> + dx⁽¹⁾<sub>local</sub> + dx⁽²⁾<sub>local</sub> + dx⁽³⁾<sub>local</sub> &nbsp;&nbsp;<span class="dim">// AllReduce(sum)；之后 GPU 0–3 上 dx 相同</span>
+</div>
+<div class="sum-line">
+  <div class="gpu-panel" style="min-width:120px"><h4>GPU 0</h4><div class="shape-name">dx⁽⁰⁾_local</div>
+    <table class="blk vec"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th></th><td class="np"></td><td class="np"></td><td class="np"></td><td class="np"></td></tr></table></div>
+  <span class="plus">+</span>
+  <div class="gpu-panel" style="min-width:120px"><h4>GPU 1</h4><div class="shape-name">dx⁽¹⁾_local</div>
+    <table class="blk vec"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th></th><td class="np"></td><td class="np"></td><td class="np"></td><td class="np"></td></tr></table></div>
+  <span class="plus">+</span>
+  <div class="gpu-panel" style="min-width:120px"><h4>GPU 2</h4><div class="shape-name">dx⁽²⁾_local</div>
+    <table class="blk vec"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th></th><td class="np"></td><td class="np"></td><td class="np"></td><td class="np"></td></tr></table></div>
+  <span class="plus">+</span>
+  <div class="gpu-panel" style="min-width:120px"><h4>GPU 3</h4><div class="shape-name">dx⁽³⁾_local</div>
+    <table class="blk vec"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th></th><td class="np"></td><td class="np"></td><td class="np"></td><td class="np"></td></tr></table></div>
+</div>
+<div class="comm">All-Reduce (sum) 后 ↓ &nbsp;·&nbsp; 反向唯一通信</div>
+<div class="gpu-row">
+  <div class="gpu-panel"><h4>GPU 0</h4><div class="shape-name">dx &nbsp; 1×4</div>
+    <table class="blk vec"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th></th><td class="nf"></td><td class="nf"></td><td class="nf"></td><td class="nf"></td></tr></table></div>
+  <div class="gpu-panel"><h4>GPU 1</h4><div class="shape-name">dx &nbsp; 1×4</div>
+    <table class="blk vec"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th></th><td class="nf"></td><td class="nf"></td><td class="nf"></td><td class="nf"></td></tr></table></div>
+  <div class="gpu-panel"><h4>GPU 2</h4><div class="shape-name">dx &nbsp; 1×4</div>
+    <table class="blk vec"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th></th><td class="nf"></td><td class="nf"></td><td class="nf"></td><td class="nf"></td></tr></table></div>
+  <div class="gpu-panel"><h4>GPU 3</h4><div class="shape-name">dx &nbsp; 1×4</div>
+    <table class="blk vec"><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+      <tr><th></th><td class="nf"></td><td class="nf"></td><td class="nf"></td><td class="nf"></td></tr></table></div>
+</div>
+
+<!-- D_FF=8 示意 -->
+<div class="box">
+  <strong>若 D<sub>FF</sub>=8、N<sub>TP</sub>=4：</strong> 每卡宽维块 = 8/4 = <strong>2 列</strong>（W1/W2）或 <strong>2 行</strong>（W3）。
+  z⁽ⁱ⁾、dz⁽ⁱ⁾、dx1⁽ⁱ⁾、dx2⁽ⁱ⁾ 形状变成 <strong>1×2</strong>，不再是 1×1——仍是矩阵，只是块变宽：
+  <div class="blk-wrap" style="margin-top:8px">
+    <span class="muted" style="font-size:0.8rem;margin-right:6px">GPU 0 例：</span>
+    <table class="blk wide2"><tr><th></th><th>E₀</th><th>E₁</th></tr>
+      <tr><th></th><td class="e"></td><td class="e"></td></tr></table>
+    <span class="mul">= z⁽⁰⁾</span>
+  </div>
+</div>
+
+<div class="box">
+  <strong>口诀</strong><br>
+  前向：Column → ⊙ → Row → <em>All-Reduce y</em><br>
+  反向：<em>dy</em> → Row(W3) → ⊙ → Column(W1,W2) → <em>All-Reduce dx</em><br>
+  宽维 E/F/G/H 全程本地；窄维 A B C D 在 FFN 出口/入口各 All-Reduce 一次。
+</div>
+
+<p class="muted" style="text-align:center;margin-top:24px">misc/misc-tp-ffn-simple.html</p>
+
+</div>
+</body>
+</html>
