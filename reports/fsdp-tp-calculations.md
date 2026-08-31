@@ -4,36 +4,42 @@
 
 ---
 
-## 0. 读完本文你应该带走什么
+## 0. 核心结论
 
-1. **FSDP 仍是 Data Parallel + 参数/梯度/optimizer 分片**；它**不是** TP，也**不是**「把激活的 $D$ 维切开去算 matmul」。
-2. **2D 并行的正确图景是嵌套，不是一张平铺的 2×4 表**：外层 **2 个 TP 组**，每组 **内部** 再含 4 路 FSDP。
-3. **FSDP 通信量除以 $N_{\mathrm{TP}}$**：因为 all-gather 拼的是 **「你这个 TP 组手里的半宽子矩阵」**，不是全球 $D\times D_{\mathrm{FF}}$；$N_{\mathrm{FSDP}}$ 出现在环形步数里，不出现在「拼完有多大」里。
-4. **前向通信有两条轴**：FSDP 横轴 all-gather 权重；TP 竖轴 all-reduce 激活。可重叠 → **max**；共享网络 → **相加**。
+1. **FSDP** = Data Parallel + 参数 / 梯度 / optimizer state 分片；激活 $x$ 的窄维 $D$ 在 TP 组内保持完整。
+2. **2D 并行** = 外层 **$N_{\mathrm{TP}}$ 个 TP 组**，每组内 **$N_{\mathrm{FSDP}}$ 路 FSDP**；8 卡即 2 组 × 每组 4 卡。
+3. **FSDP 通信字节数** $S_{\mathrm{FSDP}} = 6DD_{\mathrm{FF}}/N_{\mathrm{TP}}$：all-gather 拼的是 **本 TP 组的子矩阵**；$N_{\mathrm{FSDP}}$ 进入环形系数 $(N_{\mathrm{FSDP}}-1)/N_{\mathrm{FSDP}}$。
+4. **前向通信**：FSDP 横轴 all-gather 权重；TP 竖轴 all-reduce 激活。可重叠 → **max**；共享网络 → **相加**。
 
 > 可视化：`misc/misc-fsdp-tp-ffn.html`（$D{=}4,\,D_{\mathrm{FF}}{=}8$，2 TP × 4 FSDP，卡名 R0C0…R1C3）。
 
 ---
 
-## 0.5 先扫清三个常见疑惑
+## 0.5 切分一览：切什么、切哪一维
 
-### 疑惑 A：「FSDP 切了 $D$，又没切 $D$？」
+| 并行 | 切的对象 | 切的维度 | 切分类型 | 作用 |
+|------|----------|----------|----------|------|
+| **FSDP** | **激活** $x, y, dy, dx$ | batch 维 $B$ | 数据切分 | 每列 FSDP 卡只算 $B/N_{\mathrm{FSDP}}$ 个样本；$D$ 维保持完整 |
+| **FSDP** | **权重** $W_1, W_2, W_3$ | $W_1/W_2$ 的行（$D$ 维）；$W_3$ 的列（$D$ 维） | **存储**切分 | 参数常驻 $1/N_{\mathrm{FSDP}}$；算前 all-gather 拼回 TP 子矩阵 |
+| **FSDP** | **梯度** $dW$、**optimizer state** | 与权重同一维 | **存储**切分 | reduce-scatter 后每卡只留本地块 |
+| **TP** | **权重** $W_1, W_2$ | 输出宽维 $D_{\mathrm{FF}}$（列） | **计算**切分 | 列并行：各 TP 组管宽维一块 |
+| **TP** | **权重** $W_3$ | 输入宽维 $D_{\mathrm{FF}}$（行） | **计算**切分 | 行并行：与 $W_1/W_2$ 列切配对 |
+| **TP** | **中间激活** $z$ 及宽维块 | $D_{\mathrm{FF}}$ | **计算**切分 | 宽激活留在本 TP 卡，不上网线 |
+| **TP** | **输出激活** $y$、**输入梯度** $dx$ | 不切维；各 TP 卡算 partial | **计算**切分 | all-reduce 求和，每卡得完整 $(B/N_{\mathrm{FSDP}}, D)$ |
 
-**你的直觉有一半对：** 纯 FSDP **不会** 像 TP 那样把 matmul 的语义改成 partial output。
+2D 并行 = 上表六行 **同时成立**：TP 定宽维怎么算，FSDP 定 batch + 权重/梯度/optimizer 怎么存。
 
-Handout 在 2D 设定里让 FSDP **沿 $D$ 的行/列去分片存权重**——这是对 **$W_1/W_2$ 的行**、**$W_3$ 的列** 做 **存储切分**，不是对激活 $x$ 做 TP 式切分：
+### A. 激活 vs 权重（2D 下每卡长什么样）
 
-| 对象 | 2D 下每卡长什么样 | 算不算「切了 $D$」 |
-|------|-------------------|-------------------|
-| 激活 $x^{(j)}$ | $\bigl(\tfrac{B}{N_{\mathrm{FSDP}}},\, D\bigr)$ — **$D$ 完整** | **否**（matmul 输入仍是完整窄向量） |
-| 权重 $W_1^{(i,j)}$ | $\bigl(\tfrac{D}{N_{\mathrm{FSDP}}},\, \tfrac{D_{\mathrm{FF}}}{N_{\mathrm{TP}}}\bigr)$ — 只存部分行 | **是，但只是存**；gather 后变回 $(D,\, D_{\mathrm{FF}}/N_{\mathrm{TP}})$ |
-| 若真用 TP 切 $D$ | $x$ 也要切成 $\tfrac{D}{N_{\mathrm{TP}}}$ 再 matmul | **是语义切分** — 那是 TP，不是 FSDP |
+| 对象 | 每卡形状 | 谁切、切什么 |
+|------|----------|--------------|
+| **激活** $x^{(j)}$ | $\bigl(\tfrac{B}{N_{\mathrm{FSDP}}},\, D\bigr)$ | FSDP **切激活的 batch 维**；$D$ 维完整，matmul 输入是完整窄向量 |
+| **权重** $W_1^{(i,j)}$ | $\bigl(\tfrac{D}{N_{\mathrm{FSDP}}},\, \tfrac{D_{\mathrm{FF}}}{N_{\mathrm{TP}}}\bigr)$ | TP **切权重宽维列**（计算）；FSDP **切权重 $D$ 行**（存储）；gather 后得 $(D,\, D_{\mathrm{FF}}/N_{\mathrm{TP}})$ |
+| **纯 TP 对激活** $x$ | $\tfrac{D}{N_{\mathrm{TP}}}$ 窄块 | 仅纯 TP：**切激活 $D$ 维**再 matmul；2D 下 **不切** $x$ 的 $D$ |
 
-一句话：**FSDP 切 $D$ 只出现在「权重存在哪」；算 $xW$ 时 $x$ 的 $D$ 维在 TP 组内仍是完整的。** 讲义这里不算错，但容易读成「FSDP 也在做 TP」——实际上 2D 是 **两种切法叠在一起**，各管各的维。
+**FSDP 切 $D$ 只作用于权重/梯度/optimizer 的存储**；算 $xW$ 时 **激活** $x$ 的 $D$ 维在 TP 组内完整。2D 并行 = **TP 管权重宽维计算 + FSDP 管 batch 与权重存储**。
 
-### 疑惑 B：「2×4 矩阵，还是外层 2、内层 4？」
-
-**后者才是正确心智模型。** 8 张卡可以 **画** 成 2 行 × 4 列，但逻辑是：
+### B. 设备布局：2 个 TP 组，每组 4 张 FSDP 卡
 
 ```text
 TP 组 R0（宽维 w0–w3）          TP 组 R1（宽维 w4–w7）
@@ -44,18 +50,14 @@ TP 组 R0（宽维 w0–w3）          TP 组 R1（宽维 w4–w7）
               （同一 FSDP 列 Ck 内）
 ```
 
-- **竖向（TP）**：不同 TP 组之间 — 各算宽维的一半，要 **all-reduce 激活**。
-- **横向（FSDP）**：同一 TP 组内部 — 各存权重的一小块，要 **all-gather / reduce-scatter 权重**。
+- **竖向（TP）**：TP 组之间各算宽维一半；**all-reduce 激活** $y$（切的是激活的 partial，宽维在本地）。
+- **横向（FSDP）**：同一 TP 组内各存 **权重** 一小块；**all-gather / reduce-scatter 权重（及梯度）**。
 
-不是「8 张卡随便排成 2×4」；是 **2 个 TP 容器，每个容器里塞 4 张 FSDP 卡**。
+### C. $S_{\mathrm{FSDP}}$ 为何含 $1/N_{\mathrm{TP}}$
 
-### 疑惑 C：「$6DD_{\mathrm{FF}}$ 为什么要除以 $N_{\mathrm{TP}}$，不是 $N_{\mathrm{FSDP}}$？」
-
-这是本文 **§5.1** 的核心，这里先给结论：
-
-- **$6DD_{\mathrm{FF}}$** = 全球三个权重矩阵的总字节数（纯 FSDP、无 TP 时，**一次 gather 要拼这么大**）。
-- **加上 TP 之后**，每张卡只属于 **一个 TP 组**，永远只需要 gather **自己那一半宽** → 拼完的大小是 $\dfrac{6DD_{\mathrm{FF}}}{N_{\mathrm{TP}}}$，**所以除以 $N_{\mathrm{TP}}$**。
-- **$N_{\mathrm{FSDP}}$** 管的是：这 $\dfrac{6DD_{\mathrm{FF}}}{N_{\mathrm{TP}}}$ 被拆成几份去 gather（环形里 $(N_{\mathrm{FSDP}}-1)/N_{\mathrm{FSDP}}$），**不**再除进分子。
+- **$6DD_{\mathrm{FF}}$** = 全球三个权重矩阵总字节数（纯 FSDP 一次 gather 的目标大小）。
+- **2D 下**每张卡只属于一个 TP 组，gather **本组半宽子矩阵** → 拼完大小 $\dfrac{6DD_{\mathrm{FF}}}{N_{\mathrm{TP}}}$。
+- **$N_{\mathrm{FSDP}}$** 决定这 $\dfrac{6DD_{\mathrm{FF}}}{N_{\mathrm{TP}}}$ 拆成几份沿横排 gather → 环形系数 $(N_{\mathrm{FSDP}}-1)/N_{\mathrm{FSDP}}$。
 
 ---
 
@@ -66,8 +68,8 @@ TP 组 R0（宽维 w0–w3）          TP 组 R1（宽维 w4–w7）
 | $B$ | 全局 batch（handout §8.5 用 $(B,D)$；若带序列长 $L$，下文所有 $B$ 可换为 $B\!\cdot\!L$，与 [tensor-parallel-calculations.md](./tensor-parallel-calculations.md) 一致） |
 | $D$ | $d_{\mathrm{model}}$ |
 | $D_{\mathrm{FF}}$ | FFN 中间维 |
-| $N_{\mathrm{TP}}$ | 张量并行度（**切宽维 / 算 partial**） |
-| $N_{\mathrm{FSDP}}$ | FSDP 并行度（**切 batch + 切 TP 未切的那一维**） |
+| $N_{\mathrm{TP}}$ | 张量并行度：**切权重宽维 $D_{\mathrm{FF}}$（计算）** + **切激活 partial（all-reduce）** |
+| $N_{\mathrm{FSDP}}$ | FSDP 并行度：**切 batch（激活）** + **切权重/梯度/optimizer 的 $D$ 维（存储）** |
 | $N$ | 总设备数，$N = N_{\mathrm{TP}}\,N_{\mathrm{FSDP}}$ |
 | $(i,j)$ | 设备坐标；下文也写 **TP 行 R$i$、FSDP 列 C$j$**，卡名 **R$i$C$j$**（见 HTML 可视化） |
 | $C$ | 单设备算力（FLOP/s） |
@@ -81,10 +83,10 @@ TP 组 R0（宽维 w0–w3）          TP 组 R1（宽维 w4–w7）
 
 ### 1.1 一句话
 
-- **TP（竖 / 外层 2）**：matmul **怎么算** — $W_1,W_2$ 按 **宽维列** 切，$W_3$ 按 **宽维行** 切；组间 **all-reduce 激活**。
-- **FSDP（横 / 内层 4）**：**怎么存** + batch — 在「本 TP 组的子矩阵」里，再按 **窄维** 切存储；组内 **all-gather 权重**。
+- **TP（竖 / 外层 2）**：**切权重宽维** — $W_1,W_2$ 切 $D_{\mathrm{FF}}$ 列，$W_3$ 切 $D_{\mathrm{FF}}$ 行（计算切分）；组间 **all-reduce 激活** $y$。
+- **FSDP（横 / 内层 4）**：**切 batch（激活）** + **切权重/梯度的 $D$ 维存储** — 在本 TP 子矩阵内按行/列再分 $N_{\mathrm{FSDP}}$ 份；组内 **all-gather 权重**。
 
-两者组合：先 TP 定「全球 $W$ 的哪一块归我算」，再 FSDP 定「这一块里我存哪几行/列」。
+两者组合：TP 定「全球 $W$ 的哪块宽维归我算」；FSDP 定「这块里 **权重存储** 的哪几行/列归我存」+「**激活 batch** 的哪几样本归我算」。
 
 ### 1.2 八卡例子：2 个 TP 组 × 每组 4 FSDP
 
@@ -103,16 +105,16 @@ TP 组 R0（宽维 w0–w3）          TP 组 R1（宽维 w4–w7）
 
 #### 以 $W_1$ 为例（全球 $4\times 8$）
 
-**TP 先切列（宽维）：**
+**TP 切权重宽维（计算）：** $W_1$ 按 **列** $D_{\mathrm{FF}}$ 切成两半，每 TP 组持一块。
 
 ```text
 全球 W1:
   [ w0 w1 w2 w3 | w4 w5 w6 w7 ]
      TP 组 R0        TP 组 R1
-     形状 4×4        形状 4×4   ← 这是 W1⁽ᴿ⁰⁾、W1⁽ᴿ¹⁾，不是 4×8
+     形状 4×4        形状 4×4   ← W1⁽ᴿ⁰⁾、W1⁽ᴿ¹⁾，各为半宽
 ```
 
-**FSDP 再在 TP 组内切行（窄维存储）：**
+**FSDP 切权重 $D$ 维（存储）：** 在 TP 组 R0 的 $4\times4$ 子矩阵内，按 **行** $D$ 分给横排 4 卡。
 
 ```text
 W1⁽ᴿ⁰⁾ 的 4 行分给横排 4 卡:
@@ -123,8 +125,8 @@ W1⁽ᴿ⁰⁾ 的 4 行分给横排 4 卡:
 
 **算 $xW_1$ 时：**
 
-1. **FSDP 横排**（R0C0–R0C3）：all-gather → $W_1^{(R0)}$ 形状 $(4,\,4)$。**不是** 全球 $(4,\,8)$。
-2. **输入** $x^{(C2)}$ 形状 $(2,\,4)$：batch 按列切（$B/4{=}2$），**$D{=}4$ 完整**。
+1. **FSDP 横排**（R0C0–R0C3）：all-gather → $W_1^{(R0)}$ 形状 $(4,\,4)$（本 TP 组半宽）。
+2. **激活** $x^{(C2)}$ 形状 $(2,\,4)$：FSDP **切 batch 维**（$B/4{=}2$）；$D{=}4$ 完整。
 3. **TP 竖排**（R0C2 与 R1C2）：各自 matmul 后 **all-reduce** $y$。
 
 ```text
@@ -137,12 +139,12 @@ R1 (TP)  [····][····][····][····]  宽 w4–w7
 
 ### 1.3 三个权重的分片形状
 
-| 权重 | TP 切哪一维 | FSDP 切哪一维 | 设备 $(i,j)$ 上常驻形状 |
-|------|-------------|---------------|-------------------------|
-| $W_1,\,W_2$ | 输出维 $D_{\mathrm{FF}}$（列并行） | 输入维 $D$（行） | $\bigl(\tfrac{D}{N_{\mathrm{FSDP}}},\, \tfrac{D_{\mathrm{FF}}}{N_{\mathrm{TP}}}\bigr)$ |
-| $W_3$ | 输入维 $D_{\mathrm{FF}}$（行并行） | 输出维 $D$（列） | $\bigl(\tfrac{D_{\mathrm{FF}}}{N_{\mathrm{TP}}},\, \tfrac{D}{N_{\mathrm{FSDP}}}\bigr)$ |
+| 权重 | TP 切（计算） | FSDP 切（存储） | 设备 $(i,j)$ 上常驻形状 |
+|------|---------------|-----------------|-------------------------|
+| $W_1,\,W_2$ | 宽维 $D_{\mathrm{FF}}$ 列 | 窄维 $D$ 行 | $\bigl(\tfrac{D}{N_{\mathrm{FSDP}}},\, \tfrac{D_{\mathrm{FF}}}{N_{\mathrm{TP}}}\bigr)$ |
+| $W_3$ | 宽维 $D_{\mathrm{FF}}$ 行 | 窄维 $D$ 列 | $\bigl(\tfrac{D_{\mathrm{FF}}}{N_{\mathrm{TP}}},\, \tfrac{D}{N_{\mathrm{FSDP}}}\bigr)$ |
 
-输入：FSDP 切 batch，$x^{(j)}$ 形状 $\bigl(\tfrac{B}{N_{\mathrm{FSDP}}},\, D\bigr)$；**窄维 $D$ 在 TP 组内完整复制**（与纯 TP 不同——纯 TP 不切 batch）。
+**激活** $x^{(j)}$：FSDP **切 batch 维** → 形状 $\bigl(\tfrac{B}{N_{\mathrm{FSDP}}},\, D\bigr)$；$D$ 在 TP 组内完整复制。2D 下 batch 由 FSDP 切分（纯 TP 不切 batch）。
 
 ---
 
@@ -171,11 +173,11 @@ $$
 | $x_1,x_2,z,y^{(i,j)}$ | 与纯 TP 相同，但 batch 是 $B/N_{\mathrm{FSDP}}$ | — | — |
 | 得到 $y^{(j)}$ | — | — | **all-reduce**（固定 $j$，沿 $i$） |
 
-输出 $y^{(j)}$ 形状 $\bigl(\tfrac{B}{N_{\mathrm{FSDP}}},\, D\bigr)$：batch 仍按 FSDP 分片，窄维 $D$ 完整。
+输出 **激活** $y^{(j)}$ 形状 $\bigl(\tfrac{B}{N_{\mathrm{FSDP}}},\, D\bigr)$：FSDP **切 batch 维**（每列 $Cj$ 持 $B/N_{\mathrm{FSDP}}$ 样本）；$D$ 维完整。
 
 ---
 
-## 3. 反向（handout 省略了，但推导需要）
+## 3. 反向传播
 
 给定 $dy^{(j)}$（与 $y^{(j)}$ 同形）。TP 部分与 [tensor-parallel-calculations.md §3](./tensor-parallel-calculations.md) 相同，只是 $x,\,dy$ 的 batch 维是 $B/N_{\mathrm{FSDP}}$；FSDP 部分在权重梯度就绪后做 **reduce-scatter**（与 [fsdp-calculations.md §1](./fsdp-calculations.md) 相同，但对象是 **TP 子矩阵的梯度**）。
 
@@ -226,8 +228,8 @@ $$
 
 **两个 $N$ 从哪来：**
 
-- $N_{\mathrm{FSDP}}$：batch 切成 $B/N_{\mathrm{FSDP}}$ → 每个 matmul 的 $m$ 维缩小。
-- $N_{\mathrm{TP}}$：宽维切成 $D_{\mathrm{FF}}/N_{\mathrm{TP}}$ → 每个 matmul 的 $p$ 或收缩维缩小。
+- $N_{\mathrm{FSDP}}$：FSDP **切激活 batch 维** → 每个 matmul 的 $m$ 维为 $B/N_{\mathrm{FSDP}}$。
+- $N_{\mathrm{TP}}$：TP **切权重宽维** → 每个 matmul 的 $p$ 或收缩维为 $D_{\mathrm{FF}}/N_{\mathrm{TP}}$。
 
 All-gather 是搬运，不计 FLOP。
 
@@ -247,41 +249,39 @@ $$
 
 FP16，每元素 2 字节。环形 collective 系数见 [alternate-ring-all-reduce.md](./alternate-ring-all-reduce.md)。
 
-### 5.1 FSDP 轴 — 传 **TP 子权重**（为什么除以 $N_{\mathrm{TP}}$？）
+### 5.1 FSDP 轴 — 传 **TP 子权重**
 
-#### 先对比：纯 FSDP（无 TP）
+#### 纯 FSDP（无 TP）
 
-全球 $W_1,W_2,W_3$ 合计 $6DD_{\mathrm{FF}}$ 字节。每个 TP-less FSDP 组在 matmul 前要 all-gather **完整** $W_k$，拼完就是 $D\times D_{\mathrm{FF}}$。
+全球 $W_1,W_2,W_3$ 合计 $6DD_{\mathrm{FF}}$ 字节。matmul 前 all-gather **完整** $W_k$，拼完大小 $D\times D_{\mathrm{FF}}$。
 
-- **拼完有多大** → $6DD_{\mathrm{FF}}$（在分子）
-- **拆成几份去 gather** → $N_{\mathrm{FSDP}}$ 份（在环形系数 $(N_{\mathrm{FSDP}}-1)/N_{\mathrm{FSDP}}$）
+- **拼完大小** → $6DD_{\mathrm{FF}}$
+- **gather 份数** → $N_{\mathrm{FSDP}}$ 份（环形系数 $(N_{\mathrm{FSDP}}-1)/N_{\mathrm{FSDP}}$）
 
-#### 加上 TP 之后：gather 的目标变小了
+#### 2D：gather 本 TP 组的 **权重** 子矩阵
 
-TP 先把全球 $W_1$ 按列切成 $N_{\mathrm{TP}}$ 块。**R0 组永远只需要左半块** $W_1^{(R0)}$，形状 $(D,\, D_{\mathrm{FF}}/N_{\mathrm{TP}})$，元素个数 $DD_{\mathrm{FF}}/N_{\mathrm{TP}}$。
+TP **切权重 $W_1$ 的宽维列**（计算切分），全球 $W_1$ 分成 $N_{\mathrm{TP}}$ 块。R0 组 gather $W_1^{(R0)}$，形状 $(D,\, D_{\mathrm{FF}}/N_{\mathrm{TP}})$。
 
-FSDP 横排 gather 的是：**把 $W_1^{(R0)}$ 从 4 份行块拼回 4 行完整**，不是把全球 $4\times 8$ 拼回去。
+FSDP **切权重 $D$ 行存储**：横排把 $W_1^{(R0)}$ 从 $N_{\mathrm{FSDP}}$ 份行块拼回 $D$ 行完整。
 
-因此三个 TP 子矩阵总字节数：
+三个 TP 子矩阵总字节数：
 
 $$
 \boxed{
 S_{\mathrm{FSDP}}
 =
-\underbrace{\frac{6\,D\,D_{\mathrm{FF}}}{N_{\mathrm{TP}}}}_{\text{gather 完的大小}}
-\qquad
-\text{（不是 } \frac{6DD_{\mathrm{FF}}}{N_{\mathrm{FSDP}}} \text{）}.
+\frac{6\,D\,D_{\mathrm{FF}}}{N_{\mathrm{TP}}}.
 }
 $$
 
-**$N_{\mathrm{FSDP}}$ 在哪？** 在环形 all-gather 的 **步数/系数**里，不在 $S_{\mathrm{FSDP}}$ 的分子里：
+$N_{\mathrm{FSDP}}$ 进入环形 all-gather 的系数；$S_{\mathrm{FSDP}}$ 的分子只含 $N_{\mathrm{TP}}$：
 
 $$
 T_{\mathrm{comm}}^{\mathrm{FSDP,fwd}}
 =
-\underbrace{\frac{N_{\mathrm{FSDP}}-1}{N_{\mathrm{FSDP}}}}_{\text{FSDP 切了几份}}
+\frac{N_{\mathrm{FSDP}}-1}{N_{\mathrm{FSDP}}}
 \cdot
-\underbrace{\frac{6\,D\,D_{\mathrm{FF}}}{N_{\mathrm{TP}}\,W}}_{\text{拼完一个 TP 子矩阵要传多少}}.
+\frac{6\,D\,D_{\mathrm{FF}}}{N_{\mathrm{TP}}\,W}.
 $$
 
 #### 数字实例（$D{=}4,\,D_{\mathrm{FF}}{=}8,\,N_{\mathrm{TP}}{=}2,\,N_{\mathrm{FSDP}}{=}4$）
@@ -294,7 +294,7 @@ $$
 | $N_{\mathrm{FSDP}}$ 的作用 | 4 份行块沿横排 gather | **同上** — 仍是 4 份 |
 | $N_{\mathrm{TP}}$ 的作用 | — | 只 gather **半宽** → 字节数 **÷2** |
 
-**R0 横排 gather $W_1$：** R0C0…R0C3 各出 $1\times 4$ → 拼成 $4\times 4$（w0–w3）。**R1 组另 gather 自己的 $4\times 4$（w4–w7），与 R0 无关。**
+**R0 横排 gather $W_1$：** R0C0…R0C3 各出 $1\times 4$ → 拼成 $4\times 4$（w0–w3）。**R1 组独立 gather** 自己的 $4\times 4$（w4–w7）。
 
 记一句：**除以 $N_{\mathrm{TP}}$ =「你只拼自己 TP 组那半宽」；$N_{\mathrm{FSDP}}$ =「这半宽里拆了几份去借」。**
 
@@ -310,7 +310,7 @@ T_{\mathrm{comm}}^{\mathrm{FSDP,fwd}}
 \frac{6\,D\,D_{\mathrm{FF}}}{N_{\mathrm{TP}}\,W}.
 $$
 
-**$D_{\mathrm{FF}}$ 在分子、$N_{\mathrm{TP}}$ 在分母** — TP 切得越细，FSDP gather 越小。**Batch $B$ 不进 FSDP 权重通信。**
+**$D_{\mathrm{FF}}$ 在分子、$N_{\mathrm{TP}}$ 在分母** — TP **切权重宽维**越细，FSDP all-gather 的 **权重** 字节数越小。FSDP 权重通信量不含 batch $B$。
 
 ### 5.2 TP 轴 — 传 **激活** $y$
 
@@ -338,11 +338,11 @@ $$
 
 **数字实例（$B{=}8,\,D{=}4,\,N_{\mathrm{TP}}{=}2,\,N_{\mathrm{FSDP}}{=}4$）：** 列 C2 上 $y$ 形状 $(2,\,4)$ → $S_{\mathrm{TP}} = 2\times 8\times 4 / 4 = 16$ 字节；R0C2 与 R1C2 竖排 all-reduce 这 16 字节（环形系数再乘 $2(N_{\mathrm{TP}}-1)/N_{\mathrm{TP}}$）。
 
-注意：**$B$ 在分子，$D_{\mathrm{FF}}$ 不出现** — 跨 TP 只传窄激活。
+TP 轴传形状 $\bigl(\tfrac{B}{N_{\mathrm{FSDP}}}, D\bigr)$ 的窄激活；通信量含 $B$ 和 $D$，不含 $D_{\mathrm{FF}}$。
 
-### 5.3 可重叠 vs 不可重叠
+### 5.3 两轴通信的合并
 
-Handout 假设：**两轴 collective 可并行**（例如不同 NIC / 不同 stream）→ 墙钟时间取 **max**：
+两轴 collective **可并行**（不同 NIC / stream）→ 墙钟取 **max**：
 
 $$
 \boxed{
@@ -355,7 +355,7 @@ T_{\mathrm{comm}}^{\mathrm{TP,fwd}}
 }
 $$
 
-若 **共享同一网络、不能重叠** → **相加**：
+两轴 **共享同一网络、串行执行** → **相加**：
 
 $$
 T_{\mathrm{comm,fwd}}^{\mathrm{serial}}
@@ -387,9 +387,9 @@ T_{\mathrm{TP}}
 \frac{4\,B\,D\,N_{\mathrm{TP}}}{N\,W}.
 $$
 
-### 6.1 为什么要令 $T_{\mathrm{FSDP}}=T_{\mathrm{TP}}$？
+### 6.1 令 $T_{\mathrm{FSDP}}=T_{\mathrm{TP}}$
 
-总通信墙钟 $\approx \max(T_{\mathrm{FSDP}}, T_{\mathrm{TP}})$。若 $T_{\mathrm{FSDP}} \gg T_{\mathrm{TP}}$，加 FSDP 卡没用（横轴已瓶颈）；反之亦然。**令两者相等**时，给定 $N$ 下 $\max$ 最小。
+总通信墙钟 $\approx \max(T_{\mathrm{FSDP}}, T_{\mathrm{TP}})$。两轴相等时，给定 $N$ 下 $\max$ 取最小。
 
 令 $T_{\mathrm{FSDP}}=T_{\mathrm{TP}}$：
 
@@ -423,7 +423,7 @@ $$
 
 - **batch 大** → $N_{\mathrm{FSDP}}^{\mathrm{opt}}$ 偏大（TP 轴通信含 $B$，要多 FSDP 列养得起）。
 - **$D_{\mathrm{FF}}$ 大** → $N_{\mathrm{TP}}^{\mathrm{opt}}$ 偏大（FSDP 轴通信含 $D_{\mathrm{FF}}/N_{\mathrm{TP}}$，要多 TP 行把 gather 压小）。
-- 粗略 $N_{\mathrm{TP}}^{\mathrm{opt}} \sim N_{\mathrm{FSDP}}^{\mathrm{opt}} \sim \sqrt{N}$：总卡数增大时，**两维一起开方**，不是只堆一个轴。
+- 总卡数增大时，$N_{\mathrm{TP}}^{\mathrm{opt}}$ 与 $N_{\mathrm{FSDP}}^{\mathrm{opt}}$ 同量级 $\sim \sqrt{N}$，两维同步开方。
 
 ### 6.2 数字实例：$N=8,\,B=8,\,D_{\mathrm{FF}}=8$（与本章小 FFN 同量级）
 
@@ -439,7 +439,7 @@ N_{\mathrm{TP}}\approx 3\text{–}4,\;
 N_{\mathrm{FSDP}}\approx 2.
 $$
 
-但 handout 常用 **$N_{\mathrm{TP}}=2,\,N_{\mathrm{FSDP}}=4$** 画图时，往往 **FSDP 轴偏慢**（横轴 gather 相对竖轴 reduce 更重）——最优拆分是 **算出来的**，不是「必须 2×4」。
+Handout 常用 $N_{\mathrm{TP}}{=}2,\,N_{\mathrm{FSDP}}{=}4$ 作图例；最优拆分由公式算出，本例中 FSDP 轴通信约为 TP 轴的 3 倍。
 
 代入 **$N_{\mathrm{TP}}=2,\,N_{\mathrm{FSDP}}=4,\,D=4,\,D_{\mathrm{FF}}=8,\,B=8$**（忽略环形 $(N{-}1)/N$）：
 
@@ -448,7 +448,7 @@ $$
 | FSDP | $6DD_{\mathrm{FF}}/(N_{\mathrm{TP}}W) = 192/(2W) = 96/W$ | |
 | TP | $4BD/(N_{\mathrm{FSDP}}W) = 128/(4W) = 32/W$ | **FSDP 轴 ≈ 3× 慢** |
 
-此时应 **增大 $N_{\mathrm{TP}}$ 或减小 $N_{\mathrm{FSDP}}$** 才接近平衡 — 这就是「最优拆分」的操作含义。
+此时增大 $N_{\mathrm{TP}}$ 或减小 $N_{\mathrm{FSDP}}$ 可使两轴更接近平衡。
 
 ---
 
@@ -520,7 +520,7 @@ N
 }
 $$
 
-可重叠比不可重叠的临界 $N$ **大约 4 倍**——两轴各贡献一半时间时，串行直接翻倍；再叠加最优平衡，整体差到 $(3/2)/(3/8)=4$。
+可重叠与串行两种设定下，临界 $N$ 相差约 4 倍：$(3/2)/(3/8)=4$。
 
 ---
 
@@ -532,12 +532,12 @@ $$
 | 纯 TP | $D_{\mathrm{FF}}$ 太小 | $N_{\mathrm{TP}} \gtrsim 1 + \tfrac{3}{2}D_{\mathrm{FF}}\,W/C$ |
 | **FSDP + TP（2D）** | 两轴 **同时** 要养 | $N \gtrsim \tfrac{3}{2}B D_{\mathrm{FF}}(W/C)^2$（可重叠） |
 
-纯 FSDP：通信 $\propto 6DD_{\mathrm{FF}}$（与 $B$ 无关）。  
+纯 FSDP：通信 $\propto 6DD_{\mathrm{FF}}$，通信量不含 $B$。  
 纯 TP：通信 $\propto BLD$，计算 $\propto BLD D_{\mathrm{FF}}$，临界 $\propto D_{\mathrm{FF}}$。
 
-2D 把 **batch 维** 和 **$D_{\mathrm{FF}}$ 维** 的扩展能力 **乘在一起**：$N_{\mathrm{crit}} \propto B\cdot D_{\mathrm{FF}}$。这就是为什么工业界要 **TP 在节点内、FSDP 跨节点**——两轴各吃一个「能做大」的维度，总设备数可以远大于单轴。
+2D 把 batch 维与 $D_{\mathrm{FF}}$ 维的扩展能力相乘：$N_{\mathrm{crit}} \propto B\cdot D_{\mathrm{FF}}$。工程上常 **TP 放节点内、FSDP 跨节点**，两轴各负责一个可扩展维度。
 
-Handout 里那段话（critical batch size、scaling laws）是在说：**单靠把 batch 撑很大来喂 FSDP 会撞优化墙**；2D 并行让你还能靠 **$D_{\mathrm{FF}}$ / TP** 这条轴继续扩 $N$，而不必无限加大 batch。
+Critical batch size 与 scaling laws 指出：单靠加大 batch 喂 FSDP 会触优化上限；2D 并行还可沿 **$D_{\mathrm{FF}}$ / TP** 轴继续扩 $N$。
 
 ---
 
