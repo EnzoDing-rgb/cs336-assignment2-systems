@@ -274,6 +274,10 @@ S_{\mathrm{FSDP}}
 }
 $$
 
+> **直觉（为什么除以 $N_{\mathrm{TP}}$）**  
+> FSDP 轴传的是 **权重**。TP 已经把权重 **宽维切了一半**——你只属于一个 TP 组，all-gather 拼完的目标只是 **本组半宽子矩阵**，不是全球 $D\times D_{\mathrm{FF}}$。所以字节数 ÷ $N_{\mathrm{TP}}$。  
+> $N_{\mathrm{FSDP}}$ **不进分子**：它只决定「这半宽矩阵拆成几份去借」（环形系数），不改变拼完有多大。
+
 $N_{\mathrm{FSDP}}$ 进入环形 all-gather 的系数；$S_{\mathrm{FSDP}}$ 的分子只含 $N_{\mathrm{TP}}$：
 
 $$
@@ -317,10 +321,16 @@ $$
 对固定 FSDP 列 $j$（如 C2），all-reduce 形状 $\bigl(\tfrac{B}{N_{\mathrm{FSDP}}}, D\bigr)$ 的 FP16 张量：
 
 $$
+\boxed{
 S_{\mathrm{TP}}
 =
 \frac{2\,B\,D}{N_{\mathrm{FSDP}}}.
+}
 $$
+
+> **直觉（为什么除以 $N_{\mathrm{FSDP}}$）**  
+> TP 轴传的是 **激活** $y$（或反向的 $dx$）。FSDP 已经把 **batch 切了**——同一列 C$j$ 上的两张 TP 卡，各自只有 $B/N_{\mathrm{FSDP}}$ 个样本，$D$ 维完整。竖排 all-reduce 传的是这个 **小 batch 的激活**，不是全球 $B\times D$。所以字节数 ÷ $N_{\mathrm{FSDP}}$。  
+> $N_{\mathrm{TP}}$ **不进 $S_{\mathrm{TP}}$ 分子**：它只决定有几张 TP 卡要一起 reduce（环形系数），不改变每个激活张量本身的大小。
 
 **同一列** $x^{(j)},y^{(j)}$ 在竖排两张 TP 卡（R0C$j$、R1C$j$）上 **batch 与 $D$ 相同**；TP 只汇总 partial $y$。
 
